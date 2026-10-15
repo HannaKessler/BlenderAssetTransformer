@@ -35,7 +35,7 @@ Full coding rules are in `AGENTS.md`.
 
 `.prefab` files are ignored. Search by file name.
 
-**Importer:** imports the selected mesh into a `Pack > Meshes` collection, fixes scale and axes, and wires textures into a Principled BSDF using the Unity `.mat` texture slots (resolved through `.meta` GUIDs), falling back to texture names in the same folder. Anything unresolved is reported.
+**Importer:** imports the selected mesh into a `Pack > Meshes` collection, fixes scale and axes, and wires textures into a Principled BSDF using the Unity `.mat` texture slots (resolved through `.meta` GUIDs), falling back to texture names in the same folder. Anything unresolved is reported. Each material records its Unity shader GUID and `.mat` values (`bat_unity_shader`, `bat_unity_values`). Known custom shaders get a Blender-only preview from one shared node group (currently AnimeNaturalEnvironment foliage: height gradient + alpha clip); it is never baked, textures are untouched, and Unity's own `.mat` still defines the final look.
 
 **Exporter:** writes to `<target>/Assets/<root>/<Asset>/` as an FBX (Unity axes and scale, applied transforms, embedded material data, relative texture paths) plus named textures (`<Asset>_BaseColor`, `_Normal`, `_Metallic`, `_Roughness`, `_AO`, `_Emission`). Warns before overwriting.
 
@@ -66,4 +66,5 @@ LICENSE
 CHANGELOG.md
 AGENTS.md
 pyproject.toml     # ruff config
+.github/workflows/ # lint, release
 ```

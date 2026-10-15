@@ -1,5 +1,6 @@
 """Import library meshes into Blender and export assets to Unity target projects."""
 
+import json
 import logging
 import re
 import shutil
@@ -15,7 +16,22 @@ log = logging.getLogger(__name__)
 TYPE_PROPERTY = "bat_type"
 SOURCE_PROPERTY = "bat_source_mat"  # Unity .mat a Blender material was wired from
 LOD_NAME = re.compile(r"_lod\d+(\.\d{3})?$", re.IGNORECASE)  # Unity's LOD Group naming
-WIRED_NODES = {"TEX_IMAGE", "NORMAL_MAP", "SEPARATE_COLOR", "MATH"}
+WIRED_NODES = {"TEX_IMAGE", "NORMAL_MAP", "SEPARATE_COLOR", "MATH", "GROUP"}
+SHADER_PROPERTY = "bat_unity_shader"  # Unity shader GUID of the source .mat
+VALUES_PROPERTY = "bat_unity_values"  # its shader values, kept so Unity can rebuild the look
+# AnimeNaturalEnvironment "ASFolliage Standard": color = lerp(_Color1, _Color0,
+# saturate((objectY - _HeightStartGradient) / _HeightGradient)), clip(mask alpha - _Clip).
+FOLIAGE_SHADER = "ec957416e2e0fb44dabecd4041dcb5f8"
+FOLIAGE_GROUP = "BAT Foliage Preview"
+FOLIAGE_INPUTS = {  # group input -> (socket type, .mat property)
+    "Color 0": ("NodeSocketColor", "_Color0"),
+    "Color 1": ("NodeSocketColor", "_Color1"),
+    "Height Start": ("NodeSocketFloat", "_HeightStartGradient"),
+    "Height Gradient": ("NodeSocketFloat", "_HeightGradient"),
+    "Clip": ("NodeSocketFloat", "_Clip"),
+    "Mask Alpha": ("NodeSocketFloat", None),
+}
+HEIGHT_AXIS = "Y"  # FBX meshes keep Unity's Y-up local coordinates (object is rotated)
 ROLE_INPUTS = {
     "BaseColor": "Base Color",
     "Metallic": "Metallic",
@@ -227,6 +243,69 @@ def _use_vertex_colors(material: bpy.types.Material, objects: list[bpy.types.Obj
             return
 
 
+def _srgb_to_linear(c: float) -> float:
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _foliage_group() -> bpy.types.NodeTree:
+    """One shared preview group for every foliage material (Blender-only, never baked)."""
+    if group := bpy.data.node_groups.get(FOLIAGE_GROUP):
+        return group
+    group = bpy.data.node_groups.new(FOLIAGE_GROUP, "ShaderNodeTree")
+    for name, (kind, _) in FOLIAGE_INPUTS.items():
+        group.interface.new_socket(name, in_out="INPUT", socket_type=kind)
+    group.interface.new_socket("Base Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+    group.interface.new_socket("Alpha", in_out="OUTPUT", socket_type="NodeSocketFloat")
+    nodes, links = group.nodes, group.links
+    inp, out = nodes.new("NodeGroupInput"), nodes.new("NodeGroupOutput")
+    coords, xyz = nodes.new("ShaderNodeTexCoord"), nodes.new("ShaderNodeSeparateXYZ")
+    end, ramp = nodes.new("ShaderNodeMath"), nodes.new("ShaderNodeMapRange")
+    mix, clip = nodes.new("ShaderNodeMix"), nodes.new("ShaderNodeMath")
+    end.operation, clip.operation = "ADD", "GREATER_THAN"
+    mix.data_type, ramp.clamp = "RGBA", True
+    colors = [s for s in mix.inputs if s.type == "RGBA"]
+    links.new(coords.outputs["Object"], xyz.inputs[0])
+    links.new(xyz.outputs[HEIGHT_AXIS], ramp.inputs["Value"])
+    links.new(inp.outputs["Height Start"], ramp.inputs["From Min"])
+    links.new(inp.outputs["Height Start"], end.inputs[0])
+    links.new(inp.outputs["Height Gradient"], end.inputs[1])
+    links.new(end.outputs[0], ramp.inputs["From Max"])
+    links.new(ramp.outputs["Result"], mix.inputs["Factor"])
+    links.new(inp.outputs["Color 1"], colors[0])
+    links.new(inp.outputs["Color 0"], colors[1])
+    links.new(next(s for s in mix.outputs if s.type == "RGBA"), out.inputs["Base Color"])
+    links.new(inp.outputs["Mask Alpha"], clip.inputs[0])
+    links.new(inp.outputs["Clip"], clip.inputs[1])
+    links.new(clip.outputs[0], out.inputs["Alpha"])
+    return group
+
+
+def apply_unity_shader(material: bpy.types.Material, mat_path: Path) -> None:
+    """Record the .mat's shader and values; add the foliage preview for its known shader."""
+    guid, values = unity.shader_guid(mat_path), unity.material_values(mat_path)
+    material[SHADER_PROPERTY] = guid or ""
+    material[VALUES_PROPERTY] = json.dumps(values)
+    tree = material.node_tree
+    bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    mask = next((n for n in tree.nodes if n.type == "TEX_IMAGE" and n.label == "BaseColor"), None)
+    if guid != FOLIAGE_SHADER or bsdf is None or mask is None:
+        return
+    node = tree.nodes.new("ShaderNodeGroup")
+    node.node_tree = _foliage_group()
+    for name, (kind, prop) in FOLIAGE_INPUTS.items():
+        if prop is None:
+            continue
+        if prop not in values:
+            raise ValueError(f"{mat_path.name}: foliage shader value {prop} missing")
+        value = values[prop]
+        if kind == "NodeSocketColor":
+            value = (*(_srgb_to_linear(c) for c in value[:3]), 1.0)
+        node.inputs[name].default_value = value
+    tree.links.new(mask.outputs["Alpha"], node.inputs["Mask Alpha"])
+    tree.links.new(node.outputs["Base Color"], bsdf.inputs["Base Color"])
+    tree.links.new(node.outputs["Alpha"], bsdf.inputs["Alpha"])
+
+
 def _prune_dangling(material: bpy.types.Material) -> None:
     """Remove wiring nodes left unconnected after Unity textures replaced their links."""
     nodes = material.node_tree.nodes
@@ -299,9 +378,10 @@ def import_mesh(scene: bpy.types.Scene, path: Path, index: library.Index) -> Imp
                 result.relinked += relinked
                 result.unresolved += unlinked
                 wire_material(slot.material, textures)
-                _prune_dangling(slot.material)
                 if mat_path:
                     slot.material[SOURCE_PROPERTY] = str(mat_path)
+                    apply_unity_shader(slot.material, mat_path)
+                _prune_dangling(slot.material)
                 result.unresolved += missing
     for material in done:  # untextured: show vertex colors like Unity would
         _use_vertex_colors(material, result.objects)
@@ -335,6 +415,7 @@ def import_material(
     for material in materials:
         clear_wiring(material)
         wire_material(material, textures)
+        apply_unity_shader(material, path)
     return materials, reused, missing
 
 

@@ -31,6 +31,12 @@ _IMPORT_ANIMATION_RE = re.compile(r"^\s*importAnimation: 1\s*$", re.M)
 _MATERIAL_MODE_RE = re.compile(r"^\s*materialImportMode: (\d+)\s*$", re.M)
 _CLIP_RE = re.compile(r"^\s*takeName: ", re.M)  # one per defined animation clip
 _LEGACY_MATERIALS_RE = re.compile(r"^\s*importMaterials: (\d+)\s*$", re.M)
+_SHADER_RE = re.compile(r"^\s*m_Shader:\s*\{[^}]*guid:\s*([0-9a-f]{32})", re.M)
+_FLOAT_RE = re.compile(r"^\s*-\s*(_\w+):\s*(-?[\d.]+(?:[eE][-+]?\d+)?)\s*$", re.M)
+_COLOR_RE = re.compile(
+    r"^\s*-\s*(_\w+):\s*\{r:\s*([-\d.eE]+),\s*g:\s*([-\d.eE]+),\s*b:\s*([-\d.eE]+),\s*a:\s*([-\d.eE]+)\}",
+    re.M,
+)
 _TEX_REF_RE = re.compile(r"m_Texture:\s*\{[^}]*guid:\s*([0-9a-f]{32})")
 
 _HUB_EDITORS = {
@@ -101,6 +107,22 @@ def is_animation_only(model_meta: Path) -> bool:
     materials = _MATERIAL_MODE_RE.search(text) or _LEGACY_MATERIALS_RE.search(text)
     animated = _IMPORT_ANIMATION_RE.search(text) and _CLIP_RE.search(text)
     return bool(animated and materials and materials.group(1) == "0")
+
+
+def shader_guid(mat_path: Path) -> str | None:
+    match = _SHADER_RE.search(mat_path.read_text(encoding="utf-8", errors="replace"))
+    return match.group(1) if match else None
+
+
+def material_values(mat_path: Path) -> dict[str, float | tuple[float, ...]]:
+    """Float and color properties (`_Name: value` / `{r, g, b, a}`) from a Unity .mat."""
+    text = mat_path.read_text(encoding="utf-8", errors="replace")
+    values: dict[str, float | tuple[float, ...]] = {
+        name: float(value) for name, value in _FLOAT_RE.findall(text)
+    }
+    for name, *rgba in _COLOR_RE.findall(text):
+        values[name] = tuple(float(c) for c in rgba)
+    return values
 
 
 def material_textures(mat_path: Path) -> dict[str, str]:
