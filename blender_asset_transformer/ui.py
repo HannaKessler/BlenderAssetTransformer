@@ -21,6 +21,22 @@ class BAT_UL_entries(bpy.types.UIList):
         return flags, bpy.types.UI_UL_list.sort_items_by_name(entries, "name")
 
 
+class BAT_UL_targets(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _prop) -> None:
+        layout.label(text=item.path or "(empty)", icon="FILE_FOLDER")
+
+
+class BAT_UL_staged(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _prop) -> None:
+        row = layout.row(align=True)
+        if item.kind == "FILE":
+            row.label(text=item.name, icon="FILE")
+            row.label(text=item.pack)
+        else:
+            row.label(text=item.name, icon="OUTLINER_COLLECTION")
+            row.label(text=str(item.object_count))
+
+
 class BAT_PT_main(bpy.types.Panel):
     bl_label = "Asset Transformer"
     bl_space_type = "VIEW_3D"
@@ -63,19 +79,42 @@ class BAT_PT_main(bpy.types.Panel):
                         "bat.import_mesh", text=f"Import {entry.name}"
                     ).filepath = entry.path
             box.operator("bat.import_all", icon="IMPORT").pack = wm.bat_pack
+        elif wm.bat_type == library.ANIMATIONS and 0 <= wm.bat_entry_index < len(entries):
+            entry = entries[wm.bat_entry_index]
+            if entry.pack == wm.bat_pack and entry.type == library.ANIMATIONS:
+                if entry.name.lower().endswith(".fbx"):
+                    op = box.operator("bat.import_mesh", text=f"Import {entry.name}")
+                    op.filepath, op.animation = entry.path, True
         elif wm.bat_type == library.MATERIALS and 0 <= wm.bat_entry_index < len(entries):
             entry = entries[wm.bat_entry_index]
             if entry.pack == wm.bat_pack and entry.type == library.MATERIALS:
                 box.operator(
                     "bat.import_material", text=f"Import {entry.name}"
                 ).filepath = entry.path
+        elif wm.bat_type == library.OTHER and 0 <= wm.bat_entry_index < len(entries):
+            entry = entries[wm.bat_entry_index]
+            if entry.pack == wm.bat_pack and entry.type == library.OTHER:
+                op = box.operator("bat.stage_file", text="Add to Export", icon="EXPORT")
+                op.filepath = entry.path
+                op.pack = entry.pack
 
         box = layout.box()
+        box.label(text="Export Staging")
+        box.template_list("BAT_UL_staged", "", wm, "bat_staged", wm, "bat_staged_index", rows=3)
+        row = box.row(align=True)
+        row.operator("bat.stage_collection", icon="ADD", text="Add to Export")
+        row.operator("bat.unstage_collection", icon="REMOVE", text="")
+        row.operator("bat.clear_staged", icon="TRASH", text="")
+        box.operator("bat.join", icon="AUTOMERGE_ON")
+
+        box = layout.box()
+        box.label(text="Target Projects")
         box.template_list(
-            "UI_UL_list", "bat_targets", prefs, "recent_targets", prefs, "active_target", rows=2
+            "BAT_UL_targets", "", prefs, "recent_targets", prefs, "active_target", rows=2
         )
         box.operator("bat.add_target", icon="ADD")
         box.prop(prefs, "export_root")
-        row = box.row()
-        row.operator("bat.join", icon="AUTOMERGE_ON")
-        row.operator("bat.export_asset", icon="EXPORT")
+
+        row = layout.row()
+        row.scale_y = 1.4
+        row.operator("bat.export_staged", icon="EXPORT", depress=True)

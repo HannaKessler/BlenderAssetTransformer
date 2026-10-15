@@ -11,9 +11,10 @@ Download the release zip, then in Blender: Edit > Preferences > Get Extensions >
    Unity Hub default).
 2. In the 3D Viewport sidebar (Asset Transformer tab), click Scan Library, pick a pack and type,
    search by name, and import a mesh. It lands in a `Pack > Meshes` collection with textures wired.
-3. Add a target Unity project, select the objects, and Export to Unity. The asset is written to
-   `<target>/Assets/BlenderAssetTransformer/<Asset>/` with the FBX, named textures, and
-   `ATTRIBUTION.md`. Set up shaders in Unity.
+3. Add a target Unity project. Select a collection in the Outliner, then Add to Export (sidebar
+   button or Outliner right-click). Export Staged writes each staged collection to
+   `<target>/Assets/BlenderAssetTransformer/<Collection>/` with the FBX, named textures, and
+   `ATTRIBUTION.md`. Unity can batch-import the whole tree. Set up shaders in Unity.
 
 Use Join (Keep Licenses) instead of Ctrl+J so license records are merged.
 The library project is never modified.

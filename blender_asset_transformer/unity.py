@@ -109,6 +109,14 @@ def is_animation_only(model_meta: Path) -> bool:
     return bool(animated and materials and materials.group(1) == "0")
 
 
+def has_clips(model_meta: Path) -> bool:
+    """True if Unity imports animation clips from this model."""
+    if not model_meta.is_file():
+        return False
+    text = model_meta.read_text(encoding="utf-8", errors="replace")
+    return bool(_IMPORT_ANIMATION_RE.search(text) and _CLIP_RE.search(text))
+
+
 def shader_guid(mat_path: Path) -> str | None:
     match = _SHADER_RE.search(mat_path.read_text(encoding="utf-8", errors="replace"))
     return match.group(1) if match else None

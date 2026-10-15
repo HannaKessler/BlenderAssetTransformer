@@ -5,7 +5,7 @@ from pathlib import Path
 
 import bpy
 from bpy.props import BoolProperty, StringProperty
-from bpy_extras.io_utils import ExportHelper, ImportHelper
+from bpy_extras.io_utils import ImportHelper
 
 from . import io, library, licensing, unity
 
@@ -175,6 +175,7 @@ class BAT_OT_import(bpy.types.Operator, ImportHelper):
     bl_options = {"UNDO", "PRESET"}
 
     filter_glob: StringProperty(default=MESH_GLOB, options={"HIDDEN"})
+    animation: BoolProperty(options={"HIDDEN"})  # add clips to a matching armature
 
     def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
         if self.filepath:
@@ -187,7 +188,11 @@ class BAT_OT_import(bpy.types.Operator, ImportHelper):
             index = current_index() or scan(context)
             if not path.is_relative_to(index.root.resolve() / "Assets"):
                 raise ValueError(f"{path.name} is not inside the library project's Assets")
-            result = io.import_mesh(context.scene, path, index)
+            if self.animation:
+                done, result = io.import_animation(context.scene, path, index)
+                self.report({"INFO"}, f"{path.name}: {done}")
+            else:
+                result = io.import_mesh(context.scene, path, index)
         except (OSError, ValueError, RuntimeError) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
@@ -316,43 +321,250 @@ class BAT_OT_import_material(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class BAT_OT_export(bpy.types.Operator, ExportHelper):
-    """Export selected objects as an asset folder in the target Unity project"""
+def resolve_collection(context: bpy.types.Context, name: str) -> bpy.types.Collection:
+    """Find a collection by name, including the scene master collection."""
+    if context.scene.collection.name == name:
+        return context.scene.collection
+    collection = bpy.data.collections.get(name)
+    if collection is None:
+        raise ValueError(f"Collection not found: {name}")
+    return collection
 
-    bl_idname = "bat.export_asset"
-    bl_label = "Export to Unity"
-    bl_options = {"UNDO", "PRESET"}
 
-    filename_ext = ".fbx"
-    filter_glob: StringProperty(default="*.fbx", options={"HIDDEN"})
+def active_collection(context: bpy.types.Context) -> bpy.types.Collection:
+    return context.view_layer.active_layer_collection.collection
+
+
+def draw_outliner_collection_menu(self: bpy.types.Menu, context: bpy.types.Context) -> None:
+    layout = self.layout
+    layout.separator()
+    op = layout.operator(BAT_OT_stage.bl_idname, text="Add to Export", icon="EXPORT")
+    if context.collection:
+        op.collection = context.collection.name
+
+
+class BAT_OT_stage(bpy.types.Operator):
+    """Add the active (or named) collection to the export staging list"""
+
+    bl_idname = "bat.stage_collection"
+    bl_label = "Add to Export"
+    bl_options = {"UNDO"}
+
+    collection: StringProperty(options={"HIDDEN"})
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        name = self.collection or active_collection(context).name
+        try:
+            col = resolve_collection(context, name)
+            objects = io.collection_objects(col)
+        except ValueError as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        if not any(obj.type == "MESH" for obj in objects):
+            self.report({"ERROR"}, f"{name}: no mesh objects to export")
+            return {"CANCELLED"}
+        staged = context.window_manager.bat_staged
+        for item in staged:
+            if item.kind == "COLLECTION" and item.name == name:
+                item.object_count = len(objects)
+                self.report({"INFO"}, f"Already staged: {name}")
+                return {"FINISHED"}
+        item = staged.add()
+        item.name = name
+        item.kind = "COLLECTION"
+        item.object_count = len(objects)
+        item.path = ""
+        item.pack = ""
+        context.window_manager.bat_staged_index = len(staged) - 1
+        self.report({"INFO"}, f"Staged {name} ({len(objects)} objects)")
+        return {"FINISHED"}
+
+
+class BAT_OT_stage_file(bpy.types.Operator):
+    """Add a library Other file to the export staging list"""
+
+    bl_idname = "bat.stage_file"
+    bl_label = "Add to Export"
+    bl_options = {"UNDO"}
+
+    filepath: StringProperty(subtype="FILE_PATH")
+    pack: StringProperty()
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        path = Path(self.filepath)
+        if not path.is_file():
+            self.report({"ERROR"}, f"File not found: {path}")
+            return {"CANCELLED"}
+        pack = self.pack
+        if not pack:
+            self.report({"ERROR"}, "Pack is required to stage a library file")
+            return {"CANCELLED"}
+        key = str(path.resolve())
+        staged = context.window_manager.bat_staged
+        for item in staged:
+            if item.kind == "FILE" and item.path == key:
+                self.report({"INFO"}, f"Already staged: {path.name}")
+                return {"FINISHED"}
+        item = staged.add()
+        item.name = path.name
+        item.kind = "FILE"
+        item.path = key
+        item.pack = pack
+        item.object_count = 0
+        context.window_manager.bat_staged_index = len(staged) - 1
+        self.report({"INFO"}, f"Staged {path.name}")
+        return {"FINISHED"}
+
+
+class BAT_OT_unstage(bpy.types.Operator):
+    """Remove the selected item from the export staging list"""
+
+    bl_idname = "bat.unstage_collection"
+    bl_label = "Remove from Export"
+    bl_options = {"UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        wm = context.window_manager
+        return bool(wm.bat_staged) and 0 <= wm.bat_staged_index < len(wm.bat_staged)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        wm = context.window_manager
+        name = wm.bat_staged[wm.bat_staged_index].name
+        wm.bat_staged.remove(wm.bat_staged_index)
+        wm.bat_staged_index = min(wm.bat_staged_index, max(len(wm.bat_staged) - 1, 0))
+        self.report({"INFO"}, f"Removed {name} from staging")
+        return {"FINISHED"}
+
+
+class BAT_OT_clear_staged(bpy.types.Operator):
+    """Clear the export staging list"""
+
+    bl_idname = "bat.clear_staged"
+    bl_label = "Clear Staging"
+    bl_options = {"UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return bool(context.window_manager.bat_staged)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        context.window_manager.bat_staged.clear()
+        context.window_manager.bat_staged_index = 0
+        self.report({"INFO"}, "Cleared export staging")
+        return {"FINISHED"}
+
+
+class BAT_OT_export_staged(bpy.types.Operator):
+    """Export staged collections and library files into the active target Unity project"""
+
+    bl_idname = "bat.export_staged"
+    bl_label = "Export Staged"
+    bl_options = {"UNDO"}
+
     overwrite: BoolProperty(name="Overwrite Existing", default=False)
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
-        return any(o.type == "MESH" for o in context.selected_objects)
-
-    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
         p = prefs(context)
-        if p.recent_targets and context.active_object:
-            target = Path(p.recent_targets[p.active_target].path)
-            self.filepath = str(target / p.export_root / f"{context.active_object.name}.fbx")
-        return ExportHelper.invoke(self, context, event)
+        return bool(context.window_manager.bat_staged and p.recent_targets)
 
-    def execute(self, context: bpy.types.Context) -> set[str]:
-        asset = Path(self.filepath).stem
-        out_dir = Path(self.filepath).parent / asset
-        if out_dir.exists() and not self.overwrite:
-            self.report({"ERROR"}, f"{out_dir} exists; enable Overwrite Existing to replace it")
-            return {"CANCELLED"}
-        library_root = Path(bpy.path.abspath(prefs(context).library_path))
+    def _plans(
+        self, context: bpy.types.Context
+    ) -> list[tuple[str, str, Path, list[bpy.types.Object] | Path]]:
+        """Each plan is (kind, label, dest, payload) where payload is objects or a source Path."""
+        p = prefs(context)
+        if not (0 <= p.active_target < len(p.recent_targets)):
+            raise ValueError("No active target project selected")
+        target = Path(bpy.path.abspath(p.recent_targets[p.active_target].path))
+        if not unity.is_project(target):
+            raise ValueError(f"Not a Unity project: {target}")
+        library_root = Path(bpy.path.abspath(p.library_path))
+        plans: list[tuple[str, str, Path, list[bpy.types.Object] | Path]] = []
+        for item in context.window_manager.bat_staged:
+            if item.kind == "FILE":
+                src = Path(item.path)
+                if not src.is_file():
+                    raise ValueError(f"{item.name}: library file not found: {src}")
+                dest = io.library_file_dest(target, p.export_root, item.pack, src, library_root)
+                plans.append(("FILE", item.name, dest, src))
+                continue
+            col = resolve_collection(context, item.name)
+            objects = io.collection_objects(col)
+            if not any(obj.type == "MESH" for obj in objects):
+                raise ValueError(f"{item.name}: no mesh objects to export")
+            out_dir = io.export_dir(target, p.export_root, item.name)
+            plans.append(("COLLECTION", item.name, out_dir, objects))
+        return plans
+
+    def invoke(self, context: bpy.types.Context, _event: bpy.types.Event) -> set[str]:
         try:
-            warnings = io.export_asset(context.selected_objects, out_dir, asset, library_root)
-        except (OSError, ValueError, RuntimeError) as error:
+            plans = self._plans(context)
+        except (OSError, ValueError) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
-        for warning in warnings:
-            self.report({"WARNING"}, warning)
-        self.report({"INFO"}, f"Exported {asset} to {out_dir}")
+        self._existing = [str(dest) for _, _, dest, _ in plans if dest.exists()]
+        if self._existing and not self.overwrite:
+            return context.window_manager.invoke_props_dialog(self, width=420)
+        return self.execute(context)
+
+    def draw(self, _context: bpy.types.Context) -> None:
+        layout = self.layout
+        layout.label(text="These export paths already exist:")
+        for path in self._existing:
+            layout.label(text=path, icon="ERROR")
+        layout.prop(self, "overwrite")
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        library_root = Path(bpy.path.abspath(prefs(context).library_path))
+        try:
+            plans = self._plans(context)
+        except (OSError, ValueError) as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        blocked = [dest for _, _, dest, _ in plans if dest.exists() and not self.overwrite]
+        if blocked:
+            self.report(
+                {"ERROR"},
+                f"{blocked[0]} exists; enable Overwrite Existing to replace it",
+            )
+            return {"CANCELLED"}
+        collections = files = 0
+        for kind, label, dest, payload in plans:
+            if kind == "FILE":
+                try:
+                    written = io.copy_library_file(payload, dest, library_root)
+                except (OSError, ValueError) as error:
+                    self.report({"ERROR"}, str(error))
+                    return {"CANCELLED"}
+                self.report({"INFO"}, f"Copied {label} to {written[0]}")
+                files += 1
+                continue
+            objects = payload
+            for obj in context.view_layer.objects:
+                obj.select_set(False)
+            missing = [obj.name for obj in objects if obj.name not in context.view_layer.objects]
+            if missing:
+                self.report({"ERROR"}, f"{label}: not in view layer: {', '.join(missing)}")
+                return {"CANCELLED"}
+            for obj in objects:
+                obj.select_set(True)
+            context.view_layer.objects.active = objects[0]
+            try:
+                warnings = io.export_asset(objects, dest, label, library_root)
+            except (OSError, ValueError, RuntimeError) as error:
+                self.report({"ERROR"}, str(error))
+                return {"CANCELLED"}
+            for warning in warnings:
+                self.report({"WARNING"}, warning)
+            self.report({"INFO"}, f"Exported {label} to {dest}")
+            collections += 1
+        parts = []
+        if collections:
+            parts.append(f"{collections} collection(s)")
+        if files:
+            parts.append(f"{files} file(s)")
+        self.report({"INFO"}, f"Exported {', '.join(parts) or 'nothing'}")
         return {"FINISHED"}
 
 

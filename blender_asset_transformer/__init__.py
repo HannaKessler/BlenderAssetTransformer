@@ -21,6 +21,20 @@ class BAT_PG_entry(bpy.types.PropertyGroup):
     path: StringProperty(subtype="FILE_PATH")
 
 
+class BAT_PG_staged(bpy.types.PropertyGroup):
+    kind: EnumProperty(
+        name="Kind",
+        items=(
+            ("COLLECTION", "Collection", "Blender collection to export as FBX"),
+            ("FILE", "File", "Library file to copy into the export"),
+        ),
+        default="COLLECTION",
+    )
+    object_count: IntProperty(name="Objects")
+    path: StringProperty(name="Path", subtype="FILE_PATH")
+    pack: StringProperty(name="Pack")
+
+
 class BAT_AP_preferences(bpy.types.AddonPreferences):
     bl_idname = __package__
 
@@ -42,8 +56,11 @@ class BAT_AP_preferences(bpy.types.AddonPreferences):
 classes = (
     BAT_PG_path,
     BAT_PG_entry,
+    BAT_PG_staged,
     BAT_AP_preferences,
     ui.BAT_UL_entries,
+    ui.BAT_UL_targets,
+    ui.BAT_UL_staged,
     ui.BAT_PT_main,
     operators.BAT_OT_open_unity,
     operators.BAT_OT_scan_library,
@@ -52,7 +69,11 @@ classes = (
     operators.BAT_OT_import_all,
     operators.BAT_OT_cancel_batch,
     operators.BAT_OT_import_material,
-    operators.BAT_OT_export,
+    operators.BAT_OT_stage,
+    operators.BAT_OT_stage_file,
+    operators.BAT_OT_unstage,
+    operators.BAT_OT_clear_staged,
+    operators.BAT_OT_export_staged,
     operators.BAT_OT_join,
     operators.BAT_FH_import,
 )
@@ -66,12 +87,23 @@ def register() -> None:
     wm.bat_entry_index = IntProperty()
     wm.bat_pack = EnumProperty(name="Pack", items=operators.pack_items)
     wm.bat_type = EnumProperty(name="Type", items=[(t, t, "") for t in library.TYPES])
+    wm.bat_staged = CollectionProperty(type=BAT_PG_staged)
+    wm.bat_staged_index = IntProperty()
+    bpy.types.OUTLINER_MT_collection.append(operators.draw_outliner_collection_menu)
 
 
 def unregister() -> None:
     operators.clear_progress()
+    bpy.types.OUTLINER_MT_collection.remove(operators.draw_outliner_collection_menu)
     wm = bpy.types.WindowManager
-    for name in ("bat_type", "bat_pack", "bat_entry_index", "bat_entries"):
+    for name in (
+        "bat_staged_index",
+        "bat_staged",
+        "bat_type",
+        "bat_pack",
+        "bat_entry_index",
+        "bat_entries",
+    ):
         delattr(wm, name)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

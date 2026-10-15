@@ -26,18 +26,18 @@ Full coding rules are in `AGENTS.md`.
 
 **Open in Unity:** button launches the library project with the matching editor version from `ProjectVersion.txt`.
 
-**Browser:** scans the library's `Assets/` and lists `Pack > Type > file`, where type comes only from the extension (one exception: an `.fbx` whose `.meta` has `importAnimation: 1`, defined animation clips, and materials off, i.e. `materialImportMode: 0` or legacy `importMaterials: 0`, is listed under Animations):
+**Browser:** scans the library's `Assets/` and lists `Pack > Type > file`, where type comes only from the extension (dual listing: an `.fbx` with clips and materials on appears under Meshes and Animations; an `.fbx` whose `.meta` has `importAnimation: 1`, defined animation clips, and materials off, i.e. `materialImportMode: 0` or legacy `importMaterials: 0`, is listed under Animations):
 - Meshes: `.fbx`, `.obj`, `.blend`
 - Materials: `.mat`
 - Textures: `.png`, `.jpg`, `.tga`, `.psd`, `.tif`, `.exr`
 - Animations: `.anim`
-- Other: license and readme files
+- Other: license, readme, shaders, and anything else (not imported into Blender; can be staged for export copy)
 
 `.prefab` files are ignored. Search by file name.
 
 **Importer:** imports the selected mesh into a `Pack > Meshes` collection, fixes scale and axes, and wires textures into a Principled BSDF using the Unity `.mat` texture slots (resolved through `.meta` GUIDs), falling back to texture names in the same folder. Anything unresolved is reported. Each material records its Unity shader GUID and `.mat` values (`bat_unity_shader`, `bat_unity_values`). Known custom shaders get a Blender-only preview from one shared node group (currently AnimeNaturalEnvironment foliage: height gradient + alpha clip); it is never baked, textures are untouched, and Unity's own `.mat` still defines the final look.
 
-**Exporter:** writes to `<target>/Assets/<root>/<Asset>/` as an FBX (Unity axes and scale, applied transforms, embedded material data, relative texture paths) plus named textures (`<Asset>_BaseColor`, `_Normal`, `_Metallic`, `_Roughness`, `_AO`, `_Emission`). Warns before overwriting.
+**Exporter:** stages collections and library Other files. Collections write to `<target>/Assets/<root>/<Asset>/` as an FBX (Unity axes and scale, applied transforms, embedded material data, relative texture paths) plus named textures (`<Asset>_BaseColor`, `_Normal`, `_Metallic`, `_Roughness`, `_AO`, `_Emission`). Staged Other files are copied under `<target>/<root>/<Pack>/…` (pack-relative layout, including sidecar `.meta` when present). Warns before overwriting.
 
 **Licensing:** on import, reads license files in the pack and records pack, publisher, license, and attribution on the Blender objects. If none is found, the asset is marked "License unknown". Records are merged when assets are combined. On export, writes `ATTRIBUTION.md` next to the asset and warns about unknown or restrictive licenses. The add-on records license info but isn't legal advice.
 

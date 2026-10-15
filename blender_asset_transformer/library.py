@@ -75,7 +75,11 @@ def add_file(index: Index, path: Path) -> None:
             index.guids[guid] = path.with_suffix("")
     elif ext not in IGNORED_EXTENSIONS:
         pack = path.relative_to(index.root / "Assets").parts[0]
-        index.entries.append(Entry(pack, entry_type(path), path))
+        kind = entry_type(path)
+        index.entries.append(Entry(pack, kind, path))
+        meta = path.with_name(path.name + unity.META_SUFFIX)
+        if kind == MESHES and ext == ".fbx" and unity.has_clips(meta):  # mesh + clips: both
+            index.entries.append(Entry(pack, ANIMATIONS, path))
 
 
 def scan(project: Path) -> Index:
