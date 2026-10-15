@@ -1,0 +1,406 @@
+"""Import library meshes into Blender and export assets to Unity target projects."""
+
+import logging
+import re
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import bpy
+
+from . import library, licensing, unity
+
+log = logging.getLogger(__name__)
+
+TYPE_PROPERTY = "bat_type"
+SOURCE_PROPERTY = "bat_source_mat"  # Unity .mat a Blender material was wired from
+LOD_NAME = re.compile(r"_lod\d+(\.\d{3})?$", re.IGNORECASE)  # Unity's LOD Group naming
+WIRED_NODES = {"TEX_IMAGE", "NORMAL_MAP", "SEPARATE_COLOR", "MATH"}
+ROLE_INPUTS = {
+    "BaseColor": "Base Color",
+    "Metallic": "Metallic",
+    "Roughness": "Roughness",
+    "Emission": "Emission Color",
+}
+ROLE_SUFFIXES = ("BaseColor", "Normal", "Metallic", "Roughness", "AO", "Emission")
+ROLE_NAME_HINTS = {
+    "BaseColor": ("basecolor", "base_color", "albedo", "diffuse", "maintex"),
+    "Normal": ("normal", "nrm"),
+    "Metallic": ("metallic", "metalness"),
+    "Roughness": ("roughness",),
+    "AO": ("occlusion", "_ao"),
+    "Emission": ("emission", "emissive"),
+}
+NON_COLOR_ROLES = {"Normal", "Metallic", "Roughness", "AO"}
+
+
+@dataclass
+class ImportResult:
+    objects: list[bpy.types.Object] = field(default_factory=list)
+    unresolved: list[str] = field(default_factory=list)
+    relinked: list[str] = field(default_factory=list)
+
+
+def _child_collection(parent: bpy.types.Collection, kind: str) -> bpy.types.Collection:
+    for child in parent.children:
+        if child.get(TYPE_PROPERTY) == kind:
+            return child
+    child = bpy.data.collections.new(kind)
+    child[TYPE_PROPERTY] = kind
+    parent.children.link(child)
+    return child
+
+
+def target_collection(scene: bpy.types.Scene, pack: str) -> bpy.types.Collection:
+    """The `Pack > Meshes` collection, created if missing."""
+    pack_col = next((c for c in scene.collection.children if c.get(TYPE_PROPERTY) == pack), None)
+    if pack_col is None:
+        pack_col = bpy.data.collections.new(pack)
+        pack_col[TYPE_PROPERTY] = pack
+        scene.collection.children.link(pack_col)
+    return _child_collection(pack_col, library.MESHES)
+
+
+def _load(path: Path) -> tuple[list[bpy.types.Object], dict[bpy.types.Material, str]]:
+    """Import path; returns new objects and each new material's name as stored in the file.
+
+    Existing materials are renamed during import so Blender can't suffix clashing names.
+    """
+    before = set(bpy.data.objects.keys())  # names: cheap even with thousands of objects
+    existing = [m for m in bpy.data.materials if not m.library]
+    names = [m.name for m in existing]
+    for i, material in enumerate(existing):
+        material.name = f"bat_tmp_{i}"
+    try:
+        ext = path.suffix.lower()
+        if ext == ".fbx":
+            bpy.ops.wm.fbx_import(filepath=str(path))
+        elif ext == ".obj":
+            bpy.ops.wm.obj_import(filepath=str(path), forward_axis="NEGATIVE_Z", up_axis="Y")
+        elif ext == ".blend":
+            with bpy.data.libraries.load(str(path), link=False) as (src, dst):
+                dst.objects = src.objects
+        else:
+            raise ValueError(f"Unsupported mesh type: {path.name}")
+    finally:
+        source = {m: m.name for m in bpy.data.materials if m not in existing and not m.library}
+        for i, material in enumerate(source):
+            material.name = f"bat_new_{i}"
+        for material, name in zip(existing, names, strict=True):
+            material.name = name
+        for material, name in source.items():
+            material.name = name
+    new = set(bpy.data.objects.keys()) - before
+    return [bpy.data.objects[n] for n in new], source
+
+
+def _mat_name(name: str) -> str:
+    """Name without Blender's `.001` style suffix."""
+    return re.sub(r"\.\d{3}$", "", name)
+
+
+def _unity_material(index: library.Index, name: str, pack: str) -> Path | None:
+    matches = [e.path for e in index.entries if e.type == library.MATERIALS and e.path.stem == name]
+    return next((p for p in matches if library.pack_of(index, p) == pack), None) or (
+        matches[0] if matches else None
+    )
+
+
+def _textures_by_name(folder: Path, material_name: str) -> dict[str, Path]:
+    found: dict[str, Path] = {}
+    key = material_name.lower()
+    for path in sorted(folder.iterdir()):
+        stem = path.stem.lower()
+        if library.file_type(path) != library.TEXTURES or key not in stem:
+            continue
+        for role, hints in ROLE_NAME_HINTS.items():
+            if role not in found and any(h in stem for h in hints):
+                found[role] = path
+    return found
+
+
+def resolve_textures(
+    index: library.Index,
+    material_name: str,
+    pack: str,
+    mesh_dir: Path,
+    mat_guid: str | None = None,
+) -> tuple[dict[str, Path], list[str], Path | None]:
+    """Texture paths per role and the Unity .mat used (by the model .meta's GUID first,
+    then matched by name), falling back to texture names in mesh_dir."""
+    textures: dict[str, Path] = {}
+    missing: list[str] = []
+    remapped = index.guids.get(mat_guid or "")
+    if remapped and remapped.suffix.lower() != ".mat":
+        missing.append(f"{material_name}: .meta remap points to {remapped.name}, not a .mat")
+        remapped = None
+    mat_path = remapped or _unity_material(index, _mat_name(material_name), pack)
+    if mat_path:
+        for role, guid in unity.material_textures(mat_path).items():
+            if guid in index.guids:
+                textures[role] = index.guids[guid]
+            else:
+                missing.append(f"{material_name}: {role} GUID {guid} not in library")
+    for role, path in _textures_by_name(mesh_dir, _mat_name(material_name)).items():
+        textures.setdefault(role, path)
+    if not textures:
+        missing.append(f"{material_name}: no textures found")
+    return textures, missing, mat_path
+
+
+def _image_node(tree: bpy.types.NodeTree, path: Path, role: str) -> bpy.types.Node:
+    node = tree.nodes.new("ShaderNodeTexImage")
+    node.image = bpy.data.images.load(str(path), check_existing=True)
+    node.label = role
+    if role in NON_COLOR_ROLES:
+        node.image.colorspace_settings.name = "Non-Color"
+    return node
+
+
+def _image_missing(image: bpy.types.Image | None) -> bool:
+    return (
+        bool(image)
+        and not image.packed_file
+        and not Path(bpy.path.abspath(image.filepath)).is_file()
+    )
+
+
+def clear_wiring(material: bpy.types.Material) -> None:
+    """Remove texture wiring nodes."""
+    if material.node_tree:
+        for node in [n for n in material.node_tree.nodes if n.type in WIRED_NODES]:
+            material.node_tree.nodes.remove(node)
+
+
+def _find_texture(index: library.Index, name: str, pack: str, mesh_dir: Path) -> list[Path]:
+    """Library textures named `name` (case-insensitive): the nearest unique match walking up
+    from mesh_dir to the pack, else the unique match anywhere; several paths if ambiguous."""
+    found = [
+        e.path
+        for e in index.entries
+        if e.type == library.TEXTURES and e.path.name.lower() == name.lower()
+    ]
+    pack_root = library.pack_dir(index, pack)
+    for folder in [mesh_dir, *mesh_dir.parents]:
+        near = [p for p in found if p.is_relative_to(folder)]
+        if near or folder == pack_root:
+            return near or found
+    return found
+
+
+def _relink_missing(
+    material: bpy.types.Material, index: library.Index, pack: str, mesh_dir: Path
+) -> tuple[list[str], list[str]]:
+    """Point importer image nodes with missing files at library textures of the same name;
+    remove the ones that can't be relinked. Returns (relinked, unresolved)."""
+    relinked, unresolved = [], []
+    nodes = material.node_tree.nodes if material.node_tree else []
+    for node in [n for n in nodes if n.type == "TEX_IMAGE"]:
+        if node.image and not _image_missing(node.image):
+            continue
+        name = bpy.path.basename(node.image.filepath) if node.image else ""
+        found = _find_texture(index, name, pack, mesh_dir) if name else []
+        if len(found) == 1:
+            node.image.filepath = str(found[0])
+            node.image.reload()
+            relinked.append(f"{material.name}: {name} -> {found[0]}")
+            continue
+        if found:
+            unresolved.append(f"{material.name}: {name} ambiguous: {', '.join(map(str, found))}")
+        elif name:
+            unresolved.append(f"{material.name}: {name} not found in library")
+        nodes.remove(node)
+    return relinked, unresolved
+
+
+def _use_vertex_colors(material: bpy.types.Material, objects: list[bpy.types.Object]) -> None:
+    """Feed the mesh color attribute into Base Color when no texture drives it."""
+    bsdf = next((n for n in material.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    if bsdf is None or bsdf.inputs["Base Color"].is_linked:
+        return
+    for obj in objects:
+        attrs = getattr(obj.data, "color_attributes", None)
+        if attrs and material.name in obj.material_slots:
+            node = material.node_tree.nodes.new("ShaderNodeVertexColor")
+            node.layer_name = (attrs.active_color or attrs[0]).name
+            material.node_tree.links.new(node.outputs["Color"], bsdf.inputs["Base Color"])
+            return
+
+
+def _prune_dangling(material: bpy.types.Material) -> None:
+    """Remove wiring nodes left unconnected after Unity textures replaced their links."""
+    nodes = material.node_tree.nodes
+    while dangling := [
+        n for n in nodes if n.type in WIRED_NODES and not any(o.is_linked for o in n.outputs)
+    ]:
+        for node in dangling:
+            nodes.remove(node)
+
+
+def wire_material(material: bpy.types.Material, textures: dict[str, Path]) -> None:
+    """Connect textures to the material's Principled BSDF (Unity metallic map: R, A=smooth)."""
+    material.use_nodes = True
+    tree = material.node_tree
+    bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+    if bsdf is None:
+        bsdf = tree.nodes.new("ShaderNodeBsdfPrincipled")
+    links = tree.links
+    for role, path in textures.items():
+        image = _image_node(tree, path, role)
+        if role == "Normal":
+            normal_map = tree.nodes.new("ShaderNodeNormalMap")
+            links.new(image.outputs["Color"], normal_map.inputs["Color"])
+            links.new(normal_map.outputs["Normal"], bsdf.inputs["Normal"])
+        elif role == "Metallic" and "Roughness" not in textures:
+            split = tree.nodes.new("ShaderNodeSeparateColor")
+            invert = tree.nodes.new("ShaderNodeMath")
+            invert.operation = "SUBTRACT"
+            invert.inputs[0].default_value = 1.0
+            links.new(image.outputs["Color"], split.inputs["Color"])
+            links.new(split.outputs["Red"], bsdf.inputs["Metallic"])
+            links.new(image.outputs["Alpha"], invert.inputs[1])
+            links.new(invert.outputs["Value"], bsdf.inputs["Roughness"])
+        elif role in ROLE_INPUTS:
+            links.new(image.outputs["Color"], bsdf.inputs[ROLE_INPUTS[role]])
+            if role == "Emission":
+                bsdf.inputs["Emission Strength"].default_value = 1.0
+
+
+def import_mesh(scene: bpy.types.Scene, path: Path, index: library.Index) -> ImportResult:
+    """Import a library mesh into `Pack > Meshes`, wire textures, and record its license."""
+    pack = library.pack_of(index, path)
+    images_before = set(bpy.data.images.keys())
+    objects, source_names = _load(path)
+    result = ImportResult(objects)
+    collection = target_collection(scene, pack)
+    if any(LOD_NAME.search(o.name) for o in objects):  # keep a LOD set together
+        lods = bpy.data.collections.new(path.stem)
+        collection.children.link(lods)
+        collection = lods
+    record = licensing.detect(pack, library.pack_dir(index, pack))
+    if record.license == licensing.UNKNOWN:
+        result.unresolved.append(f"{pack}: {licensing.UNKNOWN}")
+    remap = unity.material_remap(path.with_name(path.name + ".meta"))
+    done: set[bpy.types.Material] = set()
+    for obj in result.objects:
+        for col in obj.users_collection:
+            col.objects.unlink(obj)
+        collection.objects.link(obj)
+        obj[licensing.PROPERTY] = licensing.dumps([record])
+        for slot in obj.material_slots:
+            if slot.material in source_names and slot.material not in done:
+                done.add(slot.material)
+                name = source_names[slot.material]
+                textures, missing, mat_path = resolve_textures(
+                    index, name, pack, path.parent, remap.get(name)
+                )
+                # Importer image nodes often point at the author's missing files (pink).
+                relinked, unlinked = _relink_missing(slot.material, index, pack, path.parent)
+                result.relinked += relinked
+                result.unresolved += unlinked
+                wire_material(slot.material, textures)
+                _prune_dangling(slot.material)
+                if mat_path:
+                    slot.material[SOURCE_PROPERTY] = str(mat_path)
+                result.unresolved += missing
+    for material in done:  # untextured: show vertex colors like Unity would
+        _use_vertex_colors(material, result.objects)
+    new_images = [bpy.data.images[n] for n in set(bpy.data.images.keys()) - images_before]
+    for image in [i for i in new_images if i.users == 0]:  # importer images we unlinked
+        new_images.remove(image)
+        bpy.data.images.remove(image)
+    for image in new_images:  # drop `.001` suffixes freed by the removal
+        if (base := _mat_name(image.name)) not in bpy.data.images:
+            image.name = base
+    return result
+
+
+def import_material(
+    path: Path, index: library.Index
+) -> tuple[list[bpy.types.Material], bool, list[str]]:
+    """Rewire scene materials wired from this .mat in place, or create one if none exist.
+
+    Returns (materials, reused, unresolved).
+    """
+    materials = [m for m in bpy.data.materials if m.get(SOURCE_PROPERTY) == str(path)]
+    reused = bool(materials)
+    if not reused:
+        material = bpy.data.materials.new(path.stem)
+        material[SOURCE_PROPERTY] = str(path)
+        material.use_fake_user = True  # unassigned; keep it when the file is saved
+        materials = [material]
+    guid = unity.meta_guid(path.with_name(path.name + unity.META_SUFFIX))
+    pack = library.pack_of(index, path)
+    textures, missing, _ = resolve_textures(index, path.stem, pack, path.parent, guid)
+    for material in materials:
+        clear_wiring(material)
+        wire_material(material, textures)
+    return materials, reused, missing
+
+
+def records_of(objects: list[bpy.types.Object]) -> list[licensing.Record]:
+    return licensing.merge(*(licensing.loads(o.get(licensing.PROPERTY, "")) for o in objects))
+
+
+def _role_of(node: bpy.types.Node) -> str | None:
+    return node.label if node.label in ROLE_SUFFIXES else None
+
+
+def _texture_jobs(objects: list[bpy.types.Object], asset: str) -> list[tuple[bpy.types.Image, str]]:
+    materials = list(
+        dict.fromkeys(s.material for o in objects for s in o.material_slots if s.material)
+    )
+    jobs = []
+    for material in materials:
+        if not material.node_tree:
+            continue
+        prefix = asset if len(materials) == 1 else f"{asset}_{_mat_name(material.name)}"
+        for node in material.node_tree.nodes:
+            role = _role_of(node) if node.type == "TEX_IMAGE" and node.image else None
+            if role:
+                jobs.append((node.image, f"{prefix}_{role}"))
+    return jobs
+
+
+def export_dir(target: Path, root: str, asset: str) -> Path:
+    return target / root / asset
+
+
+def export_asset(
+    objects: list[bpy.types.Object], out_dir: Path, asset: str, library_root: Path | None
+) -> list[str]:
+    """Write FBX, named textures, and ATTRIBUTION.md into out_dir; returns warnings."""
+    if library_root and out_dir.resolve().is_relative_to(library_root.resolve()):
+        raise ValueError("Refusing to export into the library project")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    original_paths = {}
+    try:
+        for image, name in _texture_jobs(objects, asset):
+            src = Path(bpy.path.abspath(image.filepath))
+            dst = out_dir / f"{name}{src.suffix or '.png'}"
+            if src.is_file():
+                shutil.copy2(src, dst)
+            else:
+                image.save(filepath=str(dst))
+            original_paths[image] = image.filepath
+            image.filepath = str(dst)
+        bpy.ops.export_scene.fbx(
+            filepath=str(out_dir / f"{asset}.fbx"),
+            use_selection=True,
+            apply_scale_options="FBX_SCALE_ALL",
+            axis_forward="-Z",
+            axis_up="Y",
+            bake_space_transform=True,
+            path_mode="RELATIVE",
+            embed_textures=False,
+        )
+    finally:
+        for image, path in original_paths.items():
+            image.filepath = path
+    records = records_of(objects)
+    (out_dir / licensing.ATTRIBUTION_FILE).write_text(
+        licensing.attribution_markdown(asset, records), encoding="utf-8"
+    )
+    if not records:
+        return [f"{asset}: no license record ({licensing.UNKNOWN})"]
+    return [f"{r.pack}: {r.license} (check terms)" for r in licensing.restrictive(records)]
