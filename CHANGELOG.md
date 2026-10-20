@@ -1,6 +1,7 @@
 # Changelog
 
 ## 0.1.0 - Unreleased
+- Animation export: clips that were cut from one take moving several objects (for example an egg and its 17 shards) export back as that one take, laid end to end, with `.meta` clips cutting it by frame range under their original names and loop settings, so each clip moves all parts together in Unity. Blender keeps one action per clip. Re-export recomputes the ranges from the current action lengths and updates only those clips. A deleted or renamed clip action fails with a clear message.
 - Import: a uniform scale on an imported model's top objects (0.01 for FBX in centimeters) is folded into the mesh and armature data and every location below it, keyed ones included, so exported models show scale 1 in Unity with the same size and motion. Non-uniform scales, constraints and non-armature modifiers fail with a clear message.
 - Export: only the exported objects' own actions become FBX takes, so clips of other assets in the same scene no longer leak in.
 - Import: LODs (`_LOD0`, `_LOD1`, ...) sharing one take that only holds a fixed transform (for example scale 0.001) get that transform baked in and the take removed; a shared take with real motion is copied per LOD.

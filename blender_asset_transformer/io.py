@@ -3,6 +3,7 @@
 import array
 import json
 import logging
+import math
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -624,6 +625,11 @@ def _clip_action(take: bpy.types.Action, clip: unity.ClipAnimation, name: str) -
     return action
 
 
+TAKE_PROPERTY = "bat_take"  # source take a clip action was cut from (multi-object takes)
+TAKE_CLIPS_PROPERTY = "bat_take_clips"  # every clip action cut from that take, in order
+CLIP_PROPERTY = "bat_clip"  # the clip's name in Unity
+
+
 def _split_takes(
     actions: list[bpy.types.Action], clips: list[unity.ClipAnimation], owner: str
 ) -> int:
@@ -632,11 +638,13 @@ def _split_takes(
     takes = [clip.take_name for clip in clips]
     made = 0
     for take in [a for a in actions if takes.count(_mat_name(a.name)) > 1]:
-        parts = [
-            _clip_action(take, clip, f"{owner}|{clip.name}")
-            for clip in clips
-            if clip.take_name == _mat_name(take.name)
-        ]
+        cut = [clip for clip in clips if clip.take_name == _mat_name(take.name)]
+        parts = [_clip_action(take, clip, f"{owner}|{clip.name}") for clip in cut]
+        if len(take.slots) > 1:  # one take moving several objects: export it back as one
+            for part, clip in zip(parts, cut, strict=True):
+                part[TAKE_PROPERTY] = clip.take_name
+                part[TAKE_CLIPS_PROPERTY] = [p.name for p in parts]
+                part[CLIP_PROPERTY] = clip.name
         take.user_remap(parts[0])
         actions.remove(take)
         bpy.data.actions.remove(take)
@@ -1343,6 +1351,95 @@ def _pop_takes(undo: list) -> None:
             item.mute = False
 
 
+def _shared_take(objects: list[bpy.types.Object]) -> tuple[str, list[bpy.types.Action]] | None:
+    """The one multi-object source take these objects' clips were cut from, with its clip
+    actions in order; None if the clips have no such origin. Raises if the clips no longer
+    match the recorded set (deleted or renamed) or mix with other actions."""
+    owned = {a for o in objects if o.animation_data for a in bpy.data.actions if _owned_slot(a, o)}
+    cut = [a for a in owned if a.get(TAKE_PROPERTY)]
+    if not cut:
+        return None
+    takes = {a[TAKE_PROPERTY] for a in cut}
+    if len(takes) > 1 or len(cut) != len(owned):
+        others = sorted(a.name for a in owned if a not in cut) or sorted(takes)
+        raise ValueError(f"clips from one shared take mixed with others ({', '.join(others)})")
+    names = list(cut[0][TAKE_CLIPS_PROPERTY])
+    if sorted(a.name for a in cut) != sorted(names) or any(
+        a.name.split("|")[-1] != a[CLIP_PROPERTY] for a in cut
+    ):
+        found = ", ".join(sorted(a.name for a in cut))
+        raise ValueError(
+            f"take {takes.pop()} was cut into {', '.join(names)}, but found {found}; "
+            "restore the deleted or renamed clip actions"
+        )
+    return cut[0][TAKE_PROPERTY], [bpy.data.actions[n] for n in names]
+
+
+def _push_shared_take(
+    objects: list[bpy.types.Object], take: str, actions: list[bpy.types.Action]
+) -> tuple[list[unity.ClipAnimation], list]:
+    """Lay the clip actions end to end on NLA strips for every object, and set the scene up so
+    the FBX gets one take named `take` covering them. Returns the Unity clips cutting that
+    take, and what to undo."""
+    scene = bpy.context.scene
+    if take in bpy.data.scenes and bpy.data.scenes[take] != scene:
+        raise ValueError(f"a scene is named {take}; rename it to export this take")
+    undo: list = [(scene, scene.name, scene.frame_start, scene.frame_end, scene.frame_current)]
+    clips, frame = [], 0
+    tracks: dict[bpy.types.Object, bpy.types.NlaTrack] = {}  # one track: strips play in turn
+    for action in actions:
+        start, end = action.frame_range
+        for obj in objects:
+            slot = _owned_slot(action, obj)
+            if slot is None:
+                continue
+            anim = obj.animation_data
+            if not any(isinstance(u, tuple) and u[0] == "obj" and u[1] is obj for u in undo):
+                undo.append(("obj", obj, anim.action, anim.action_slot))
+                for track in anim.nla_tracks:
+                    if not track.mute:
+                        track.mute = True
+                        undo.append(track)
+                anim.action = None
+            if obj not in tracks:
+                tracks[obj] = anim.nla_tracks.new()
+                undo.append((obj, tracks[obj]))
+            strip = tracks[obj].strips.new(action[CLIP_PROPERTY], frame, action)
+            strip.action_slot = slot
+        clips.append(
+            unity.ClipAnimation(
+                name=action[CLIP_PROPERTY],
+                take_name=take,
+                first_frame=float(frame),
+                last_frame=frame + end - start,
+                wrap_mode=unity.WRAP_LOOP if action.use_cyclic else unity.WRAP_DEFAULT,
+                loop=action.use_cyclic,
+                loop_time=action.use_cyclic,
+            )
+        )
+        frame = math.ceil(frame + end - start) + 1
+    scene.name = take
+    scene.frame_start, scene.frame_end = 0, frame - 1
+    return clips, undo
+
+
+def _pop_shared_take(undo: list) -> None:
+    for item in reversed(undo):
+        if isinstance(item, tuple) and item[0] == "obj":
+            _, obj, action, slot = item
+            obj.animation_data.action = action
+            obj.animation_data.action_slot = slot
+        elif isinstance(item, tuple) and len(item) == 5:
+            scene, name, start, end, current = item
+            scene.name, scene.frame_start, scene.frame_end = name, start, end
+            scene.frame_set(current)
+        elif isinstance(item, tuple):
+            obj, track = item
+            obj.animation_data.nla_tracks.remove(track)
+        else:
+            item.mute = False
+
+
 def _fbx_take_names(fbx: Path) -> list[str]:
     """AnimStack (take) names Unity will see in an FBX written by Blender."""
     from io_scene_fbx import parse_fbx  # bundled with Blender, like the FBX exporter itself
@@ -1423,6 +1520,9 @@ def export_asset(
     saved_names: list[tuple[bpy.types.Material, str]] = []
     takes: dict[str, bpy.types.Action] = {}
     nla_undo: list = []
+    shared_undo: list = []
+    shared = None
+    cut_clips: list[unity.ClipAnimation] = []
     fbx = out_dir / f"{asset}.fbx"
     texture_guids: dict[tuple, str] = {}
     fbx_names: dict[bpy.types.Material, str] = {}
@@ -1442,7 +1542,10 @@ def export_asset(
         fbx_names = {
             s.material: s.material.name for o in objects for s in o.material_slots if s.material
         }
-        takes, nla_undo = _push_takes(objects)
+        if shared := _shared_take(objects):
+            cut_clips, shared_undo = _push_shared_take(objects, *shared)
+        else:
+            takes, nla_undo = _push_takes(objects)
         bpy.ops.export_scene.fbx(
             filepath=str(fbx),
             use_selection=True,
@@ -1453,15 +1556,21 @@ def export_asset(
             path_mode="RELATIVE",
             embed_textures=False,
             bake_anim_use_all_actions=False,
-            bake_anim_use_nla_strips=True,
+            bake_anim_use_nla_strips=not shared,  # a shared take: the whole scene timeline
         )
     finally:
+        _pop_shared_take(shared_undo)
         _pop_takes(nla_undo)
         _restore_names(saved_names)
         _restore_links(saved_links)
         for image, path in original_paths.items():
             image.filepath = path
-    clips = _export_clips(takes, _fbx_take_names(fbx))
+    if shared:
+        if _fbx_take_names(fbx) != [shared[0]]:
+            raise ValueError(f"{fbx.name}: expected the single take {shared[0]}")
+        clips = cut_clips
+    else:
+        clips = _export_clips(takes, _fbx_take_names(fbx))
     remaps, notes = _export_materials(out_dir, fbx_names, texture_guids, asset, library_root)
     if clips or remaps:
         unity.write_model_meta(fbx.with_name(fbx.name + unity.META_SUFFIX), clips, remaps)

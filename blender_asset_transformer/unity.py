@@ -285,8 +285,9 @@ def merge_clip_animations(text: str, clips: list[ClipAnimation], label: str) -> 
     """Update frame range and loop fields of clips matched by takeName; append the rest.
 
     Drops clips whose take is no longer exported (deleted or renamed actions). A take that
-    the user split into several clips in Unity is left as is. Keeps the GUID and every other
-    field. Raises if the .meta layout is not recognized.
+    the user split into several clips in Unity is left as is; a take the add-on cuts itself
+    (several clips passed for it) has those clips updated by name, other clips kept. Keeps
+    the GUID and every other field. Raises if the .meta layout is not recognized.
     """
     marker = re.search(r"^( *)clipAnimations:[ \t]*(.*)\n", text, re.M)
     if not marker or not _GUID_RE.search(text):
@@ -302,7 +303,6 @@ def merge_clip_animations(text: str, clips: list[ClipAnimation], label: str) -> 
             end += len(line)
     entries = re.split(rf"(?m)^(?={re.escape(indent)}- )", text[start:end])
     entries = [e for e in entries if e]
-    by_take = {clip.take_name: clip for clip in clips}
     takes = []
     for entry in entries:
         take = re.search(r"^ *takeName: (.+)$", entry, re.M)
@@ -310,18 +310,26 @@ def merge_clip_animations(text: str, clips: list[ClipAnimation], label: str) -> 
             raise ValueError(f"{label}: clipAnimations entry without takeName")
         takes.append(_yaml_str(take.group(1)))
     split = {take for take in takes if takes.count(take) > 1}
+    passed = [clip.take_name for clip in clips]
+    cut = {take for take in passed if passed.count(take) > 1}  # takes the add-on cuts itself
+    by_take = {clip.take_name: clip for clip in clips if clip.take_name not in cut}
+    by_cut = {(clip.take_name, clip.name): clip for clip in clips if clip.take_name in cut}
     updated: list[str] = []
     for entry, take in zip(entries, takes, strict=True):
-        if take not in by_take and take not in split:
+        if take in cut:  # update the add-on's clips by name; keep clips added in Unity
+            name = re.search(r"^ *name: (.*)$", entry, re.M)
+            clip = by_cut.pop((take, _yaml_str(name.group(1)) if name else ""), None)
+        elif take not in by_take and take not in split:
             continue
-        clip = by_take.pop(take, None)
-        if clip and take not in split:
+        else:
+            clip = by_take.pop(take, None)
+        if clip and (take not in split or take in cut):
             for key, value in _clip_values(clip).items():
                 entry, count = re.subn(rf"(?m)^( *{key}): .*$", rf"\g<1>: {value}", entry, 1)
                 if not count:
                     raise ValueError(f"{label}: clip {clip.take_name} has no {key} field")
         updated.append(entry)
-    updated += [_clip_entry(clip, indent) for clip in by_take.values()]
+    updated += [_clip_entry(clip, indent) for clip in [*by_take.values(), *by_cut.values()]]
     head = text[: marker.start()] + f"{indent}clipAnimations:\n"
     return head + "".join(updated) + text[end:]
 
