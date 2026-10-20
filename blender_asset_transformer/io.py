@@ -380,12 +380,52 @@ def wire_material(material: bpy.types.Material, textures: dict[str, Path]) -> No
                 bsdf.inputs["Emission Strength"].default_value = 1.0
 
 
+TRANSFORM_PATHS = {"location", "rotation_euler", "rotation_quaternion", "scale"}
+
+
+def _unshare_lod_actions(lods: list[bpy.types.Object]) -> None:
+    """LODs often share one take that only holds their transform (e.g. scale 0.001). A static
+    one is baked into each LOD's transform and dropped; one with motion is copied per LOD, so
+    no LOD depends on another's action slot."""
+    from bpy_extras import anim_utils
+
+    shared = [o.animation_data.action for o in lods if o.animation_data and o.animation_data.action]
+    for obj in lods:
+        anim = obj.animation_data
+        if anim is None or anim.action is None:
+            continue
+        action, slot = anim.action, anim.action_slot
+        bag = anim_utils.action_get_channelbag_for_slot(action, slot) if slot else None
+        fcurves = list(bag.fcurves) if bag else []
+        static = all(
+            fc.data_path in TRANSFORM_PATHS
+            and max(k.co[1] for k in fc.keyframe_points) - min(k.co[1] for k in fc.keyframe_points)
+            < 1e-6
+            for fc in fcurves
+            if fc.keyframe_points
+        )
+        if static:
+            for fc in fcurves:
+                if fc.keyframe_points:
+                    getattr(obj, fc.data_path)[fc.array_index] = fc.keyframe_points[0].co[1]
+            obj.animation_data_clear()
+        elif shared.count(action) > 1:
+            own = action.copy()
+            own.name = f"{obj.name}|{_mat_name(action.name).split('|')[-1]}"
+            anim.action = own
+            anim.action_slot = own.slots[slot.identifier]
+    for action in set(shared):
+        if action.users <= int(action.use_fake_user):
+            bpy.data.actions.remove(action)
+
+
 def import_mesh(scene: bpy.types.Scene, path: Path, index: library.Index) -> ImportResult:
     """Import a library mesh into `Pack > Meshes`, wire textures, and record its license."""
     pack = library.pack_of(index, path)
     images_before = set(bpy.data.images.keys())
     actions_before = set(bpy.data.actions.keys())
     objects, source_names = _load(path)
+    _unshare_lod_actions([o for o in objects if LOD_NAME.search(o.name)])
     new_actions = [bpy.data.actions[n] for n in set(bpy.data.actions.keys()) - actions_before]
     if new_actions and path.suffix.lower() == ".fbx":
         owner = next((o.name for o in objects if o.type == "ARMATURE"), path.stem)
@@ -1177,26 +1217,58 @@ def _unity_values(objects: list[bpy.types.Object], asset: str) -> dict:
     return out
 
 
-def _strip_take_prefixes(objects: list[bpy.types.Object]) -> dict[bpy.types.Action, str]:
-    """Drop a leading `<Object>|` from action names, since the FBX exporter prefixes the object
-    name to every take (`Arm_Cat|Arm_Cat|Idle` otherwise). Returns original names to restore."""
-    prefixes = tuple(f"{o.name}|" for o in objects if o.animation_data)
-    saved: dict[bpy.types.Action, str] = {}
-    for action in bpy.data.actions:
-        prefix = next((p for p in prefixes if action.name.startswith(p)), None)
-        if prefix is None:
+def _owned_slot(action: bpy.types.Action, obj: bpy.types.Object) -> bpy.types.ActionSlot | None:
+    """The action's slot made for this object (by name), or None if it animates something else."""
+    for slot in action.slots:
+        if slot.target_id_type == "OBJECT" and _mat_name(slot.name_display) == _mat_name(obj.name):
+            return slot
+    return None
+
+
+def _push_takes(objects: list[bpy.types.Object]) -> tuple[dict[str, bpy.types.Action], list]:
+    """Put each object's own actions on temporary NLA strips named like the take
+    (`<Object>|<Clip>`, without repeating an existing `<Object>|` prefix) and mute the
+    object's other tracks, so the FBX exports only this asset's clips. Returns take -> action
+    and what to undo."""
+    takes: dict[str, bpy.types.Action] = {}
+    undo: list = []
+    for obj in objects:
+        anim = obj.animation_data
+        if anim is None:
             continue
-        saved[action] = original = action.name
-        action.name = original[len(prefix) :]
-        if action.name != original[len(prefix) :]:
-            _restore_action_names(saved)
-            raise ValueError(f"Can't export {original}: another action is named {action.name}")
-    return saved
+        for track in anim.nla_tracks:
+            if not track.mute:
+                track.mute = True
+                undo.append(track)
+        for action in bpy.data.actions:
+            slot = anim.action_slot if action == anim.action else _owned_slot(action, obj)
+            if slot is None:
+                continue
+            prefix = f"{obj.name}|"
+            take = action.name if action.name.startswith(prefix) else prefix + action.name
+            track = anim.nla_tracks.new()
+            undo.append((obj, track))
+            strip = track.strips.new(take, int(action.frame_range[0]), action)
+            strip.action_slot = slot
+            strip.name = take
+            takes[strip.name] = action
+        if anim.action:  # the strips drive the object; an active shared action loses its slot
+            undo.append((anim, anim.action, anim.action_slot))
+            anim.action = None
+    return takes, undo
 
 
-def _restore_action_names(saved: dict[bpy.types.Action, str]) -> None:
-    for action, name in saved.items():
-        action.name = name
+def _pop_takes(undo: list) -> None:
+    for item in reversed(undo):
+        if isinstance(item, tuple) and len(item) == 3:
+            anim, action, slot = item
+            anim.action = action
+            anim.action_slot = slot
+        elif isinstance(item, tuple):
+            obj, track = item
+            obj.animation_data.nla_tracks.remove(track)
+        else:
+            item.mute = False
 
 
 def _fbx_take_names(fbx: Path) -> list[str]:
@@ -1210,16 +1282,14 @@ def _fbx_take_names(fbx: Path) -> list[str]:
     return [e.props[1].split(FBX_NAME_CLASS_SEP)[0].decode() for e in stacks]
 
 
-def _export_clips(objects: list[bpy.types.Object], takes: list[str]) -> list[unity.ClipAnimation]:
+def _export_clips(
+    takes: dict[str, bpy.types.Action], written: list[str]
+) -> list[unity.ClipAnimation]:
     """Unity clip settings per exported take: range from the action (FBX takes start at 0),
     looping from the action's Cyclic Animation flag."""
-    owners = [o.name for o in objects if o.animation_data]
     clips = []
-    for take in takes:
-        owner = next((n for n in owners if take.startswith(f"{n}|")), None)
-        action = bpy.data.actions.get(take)
-        if action is None and owner is not None:
-            action = bpy.data.actions.get(take[len(owner) + 1 :])
+    for take in written:
+        action = takes.get(take)
         if action is None:
             raise ValueError(f"FBX take {take} has no matching Blender action")
         start, end = action.frame_range
@@ -1279,7 +1349,8 @@ def export_asset(
     original_paths = {}
     saved_links: list[tuple] = []
     saved_names: list[tuple[bpy.types.Material, str]] = []
-    saved_actions: dict[bpy.types.Action, str] = {}
+    takes: dict[str, bpy.types.Action] = {}
+    nla_undo: list = []
     fbx = out_dir / f"{asset}.fbx"
     texture_guids: dict[tuple, str] = {}
     fbx_names: dict[bpy.types.Material, str] = {}
@@ -1299,7 +1370,7 @@ def export_asset(
         fbx_names = {
             s.material: s.material.name for o in objects for s in o.material_slots if s.material
         }
-        saved_actions = _strip_take_prefixes(objects)
+        takes, nla_undo = _push_takes(objects)
         bpy.ops.export_scene.fbx(
             filepath=str(fbx),
             use_selection=True,
@@ -1309,14 +1380,16 @@ def export_asset(
             bake_space_transform=True,
             path_mode="RELATIVE",
             embed_textures=False,
+            bake_anim_use_all_actions=False,
+            bake_anim_use_nla_strips=True,
         )
     finally:
-        _restore_action_names(saved_actions)
+        _pop_takes(nla_undo)
         _restore_names(saved_names)
         _restore_links(saved_links)
         for image, path in original_paths.items():
             image.filepath = path
-    clips = _export_clips(objects, _fbx_take_names(fbx))
+    clips = _export_clips(takes, _fbx_take_names(fbx))
     remaps, notes = _export_materials(out_dir, fbx_names, texture_guids, asset, library_root)
     if clips or remaps:
         unity.write_model_meta(fbx.with_name(fbx.name + unity.META_SUFFIX), clips, remaps)

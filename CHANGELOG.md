@@ -1,6 +1,8 @@
 # Changelog
 
 ## 0.1.0 - Unreleased
+- Export: only the exported objects' own actions become FBX takes, so clips of other assets in the same scene no longer leak in.
+- Import: LODs (`_LOD0`, `_LOD1`, ...) sharing one take that only holds a fixed transform (for example scale 0.001) get that transform baked in and the take removed; a shared take with real motion is copied per LOD.
 - Animation import: an animation FBX that stores its rig as empties (for example Malbers wyvern clips) is baked onto the scene armature whose bones it names, so the clips play on that model.
 - Export: a pack shader that works in URP (a `.shader` with a UniversalPipeline tag, or a `.shadergraph` with a Universal target, with all its includes and sub graphs found) is copied with its `.meta` into `<root>/Shaders/` (GUID kept), and the material keeps that shader. A shader already in the project isn't copied again. Other shaders fall back to URP Lit, and the export message lists them.
 - Export: textures the source `.mat` uses but the Blender material doesn't (custom shader inputs) are copied from the library. A texture missing from the library is left empty and noted.
