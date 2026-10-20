@@ -1,6 +1,7 @@
 # Changelog
 
 ## 0.1.0 - Unreleased
+- Import: a uniform scale on an imported model's top objects (0.01 for FBX in centimeters) is folded into the mesh and armature data and every location below it, keyed ones included, so exported models show scale 1 in Unity with the same size and motion. Non-uniform scales, constraints and non-armature modifiers fail with a clear message.
 - Export: only the exported objects' own actions become FBX takes, so clips of other assets in the same scene no longer leak in.
 - Import: LODs (`_LOD0`, `_LOD1`, ...) sharing one take that only holds a fixed transform (for example scale 0.001) get that transform baked in and the take removed; a shared take with real motion is copied per LOD.
 - Animation import: an animation FBX that stores its rig as empties (for example Malbers wyvern clips) is baked onto the scene armature whose bones it names, so the clips play on that model.

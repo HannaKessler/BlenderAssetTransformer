@@ -97,12 +97,83 @@ def unit_note(scene: bpy.types.Scene) -> str | None:
     return f"Scene unit scale {scale:g}: FBX imported x{correction:g}, exported in meters"
 
 
+DATA_FREE = {"EMPTY", "LIGHT", "CAMERA", "LIGHT_PROBE", "SPEAKER"}
+
+
+def _slot_fcurves(actions: list[bpy.types.Action], obj: bpy.types.Object) -> list:
+    """F-curves of every action slot made for obj."""
+    from bpy_extras import anim_utils
+
+    curves = []
+    for action in actions:
+        for slot in action.slots:
+            if slot.target_id_type == "OBJECT" and slot.name_display == obj.name:
+                if bag := anim_utils.action_get_channelbag_for_slot(action, slot):
+                    curves += bag.fcurves
+    return curves
+
+
+def _scale_fcurve(fc: bpy.types.FCurve, factor: float) -> None:
+    for key in fc.keyframe_points:
+        key.co[1] *= factor
+        key.handle_left[1] *= factor
+        key.handle_right[1] *= factor
+
+
+def _normalize_root_scale(objects: list[bpy.types.Object], actions: list[bpy.types.Action]) -> None:
+    """Fold a uniform root scale (FBX in centimeters comes in at 0.01) into the data below it,
+    so Unity sees scale 1 on the model's top objects with the same world size and motion:
+    mesh and armature data and every location under the root (static and keyed, bones too)
+    are multiplied by the root scale, and the root's scale becomes 1."""
+    done: dict = {}
+    for root in [o for o in objects if o.parent is None]:
+        factor = root.scale[0]
+        if abs(factor - 1) < 1e-6:
+            continue
+        if max(root.scale) - min(root.scale) > 1e-6 * abs(factor):
+            raise ValueError(f"{root.name}: non-uniform scale {tuple(root.scale)}; apply it first")
+        scale = Matrix.Scale(factor, 4)
+        tree = [root, *root.children_recursive]
+        for obj in tree:
+            if obj.constraints or (obj.pose and any(b.constraints for b in obj.pose.bones)):
+                raise ValueError(f"{obj.name}: constraints block unit scale normalization")
+            if any(m.type != "ARMATURE" for m in obj.modifiers):
+                raise ValueError(f"{obj.name}: modifiers block unit scale normalization")
+            if obj.data is not None and obj.type not in DATA_FREE:
+                if not hasattr(obj.data, "transform"):
+                    raise ValueError(f"{obj.name}: can't rescale {obj.type} data")
+                if done.setdefault(obj.data, factor) != factor:
+                    raise ValueError(f"{obj.name}: data shared at different scales")
+        for data in {o.data for o in tree if o.data is not None and o.type not in DATA_FREE}:
+            if isinstance(data, bpy.types.Mesh):
+                data.transform(scale, shape_keys=True)
+            else:
+                data.transform(scale)
+        for obj in tree:
+            for fc in _slot_fcurves(actions, obj):
+                if obj is root and fc.data_path == "scale":
+                    _scale_fcurve(fc, 1 / factor)
+                elif obj is not root and fc.data_path == "location":
+                    _scale_fcurve(fc, factor)
+                elif fc.data_path.startswith("pose.bones[") and fc.data_path.endswith(".location"):
+                    _scale_fcurve(fc, factor)
+            if obj.pose:
+                for bone in obj.pose.bones:
+                    bone.location *= factor
+            if obj is root:
+                obj.scale /= factor
+            else:
+                obj.location *= factor
+                obj.matrix_parent_inverse = scale @ obj.matrix_parent_inverse @ scale.inverted()
+
+
 def _load(path: Path) -> tuple[list[bpy.types.Object], dict[bpy.types.Material, str]]:
     """Import path; returns new objects and each new material's name as stored in the file.
 
     Existing materials are renamed during import so Blender can't suffix clashing names.
     """
     before = set(bpy.data.objects.keys())  # names: cheap even with thousands of objects
+    actions_before = set(bpy.data.actions.keys())
     existing = [m for m in bpy.data.materials if not m.library]
     names = [m.name for m in existing]
     for i, material in enumerate(existing):
@@ -141,8 +212,9 @@ def _load(path: Path) -> tuple[list[bpy.types.Object], dict[bpy.types.Material, 
             material.name = name
         for material, name in source.items():
             material.name = name
-    new = set(bpy.data.objects.keys()) - before
-    return [bpy.data.objects[n] for n in new], source
+    new = [bpy.data.objects[n] for n in set(bpy.data.objects.keys()) - before]
+    _normalize_root_scale(new, [a for a in bpy.data.actions if a.name not in actions_before])
+    return new, source
 
 
 def _mat_name(name: str) -> str:
