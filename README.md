@@ -14,7 +14,12 @@ Download the release zip, then in Blender: Edit > Preferences > Get Extensions >
 3. Add a target Unity project. Select a collection in the Outliner, then Add to Export (sidebar
    button or Outliner right-click). Export Staged writes each staged collection to
    `<target>/Assets/BlenderAssetTransformer/<Collection>/` with the FBX, named textures, and
-   `ATTRIBUTION.md`. Unity can batch-import the whole tree. Set up shaders in Unity.
+   `ATTRIBUTION.md`. Animated FBX also get a `.meta` with each clip's frame range and Loop Time
+   (from the action's Cyclic Animation). Materials are written to `Materials/` and remapped:
+   when the pack's shader works in URP it is copied to `Shaders/` and used, otherwise URP Lit
+   is used and the export message says so. On re-export, materials keep your Unity edits (only
+   texture references are refreshed) and GUIDs stay the same. Unity can batch-import the whole
+   tree.
 
 Use Join (Keep Licenses) instead of Ctrl+J so license records are merged.
 The library project is never modified.

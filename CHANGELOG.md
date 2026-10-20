@@ -1,6 +1,25 @@
 # Changelog
 
 ## 0.1.0 - Unreleased
+- Animation import: an animation FBX that stores its rig as empties (for example Malbers wyvern clips) is baked onto the scene armature whose bones it names, so the clips play on that model.
+- Export: a pack shader that works in URP (a `.shader` with a UniversalPipeline tag, or a `.shadergraph` with a Universal target, with all its includes and sub graphs found) is copied with its `.meta` into `<root>/Shaders/` (GUID kept), and the material keeps that shader. A shader already in the project isn't copied again. Other shaders fall back to URP Lit, and the export message lists them.
+- Export: textures the source `.mat` uses but the Blender material doesn't (custom shader inputs) are copied from the library. A texture missing from the library is left empty and noted.
+- Export: a source material variant becomes a plain material (its parent stays in the library).
+- Export: re-export keeps an existing `.mat` and only updates its texture references, so edits made in Unity survive.
+- Export: materials without a Unity source get a URP Lit `.mat` from their Principled BSDF values.
+- Import: OBJ and `.blend` files also keep their real size when the scene unit scale isn't 1.
+- Export: materials that came from a Unity `.mat` are written as URP Lit `.mat` files in `<Asset>/Materials/` (base color, metallic map with smoothness from alpha, normal, occlusion, emission, cutout, culling, tiling translated from the source shader) and remapped in the FBX `.meta` `externalObjects`; GUIDs stay stable across re-exports.
+- Export: exported textures always get a `.meta` (GUID needed for remaps); data maps (metallic, AO, roughness) are linear.
+- Import: HDRP mask maps are wired as the metallic map (R metallic, A smoothness).
+- Animation import: a take that Unity splits into several clips becomes one action per clip (`<Armature>|<Clip>`, starting at frame 1, with its loop settings); the whole-take action is removed.
+- Unit scale: FBX import cancels a non-1 scene unit scale so assets keep their real size; export already writes meters. The operators report the correction.
+- Export: re-export drops `.meta` clips whose action was deleted or renamed; takes split into several clips in Unity are left untouched; clip names with `: `, `#` or quotes are quoted.
+- Export: copied library texture `.meta` gets its own GUID (no clash when assets share a texture or the pack is also in the project); re-export keeps it.
+- Export: an empty collection fails with a clear error instead of writing an empty FBX.
+- Animation export: write the FBX `.meta` `clipAnimations` (frame range, Loop Time from the action's Cyclic Animation) so looping clips loop in Unity; existing `.meta` keeps its GUID and other settings.
+- Animation export: take names no longer repeat the armature name (`Arm_Cat|Idle`, not `Arm_Cat|Arm_Cat|Idle`).
+- Animation import: map Unity ModelImporter `clipAnimations` (loopTime / wrapMode / frame range) onto Blender actions (`use_cyclic`, manual frame range, Cycles F-Modifier).
+- Animation re-import replaces the earlier copies of the same clips (so loop settings apply to the clips already in use); clip matching ignores `.001` suffixes.
 - Library browser (Pack > Type > file), filename search, Open in Unity.
 - Import into `Pack > Meshes` with Principled BSDF wiring from Unity `.mat`/`.meta`.
 - Foliage export: when a texture (e.g. PSD) has no Blender pixels, convert/copy from the library filepath on disk instead of failing.

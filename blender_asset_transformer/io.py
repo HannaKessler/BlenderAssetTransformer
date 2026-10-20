@@ -9,12 +9,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import bpy
+from mathutils import Matrix
 
 from . import library, licensing, unity
 
 log = logging.getLogger(__name__)
 
 TYPE_PROPERTY = "bat_type"
+MATERIALS_DIR = "Materials"
+NATIVE_IMPORTER_META = "NativeFormatImporter:\n  externalObjects: {}\n  mainObjectFileID: 2100000\n"
 SOURCE_PROPERTY = "bat_source_mat"  # Unity .mat a Blender material was wired from
 LOD_NAME = re.compile(r"_lod\d+(\.\d{3})?$", re.IGNORECASE)  # Unity's LOD Group naming
 WIRED_NODES = {"TEX_IMAGE", "NORMAL_MAP", "SEPARATE_COLOR", "MATH", "GROUP"}
@@ -49,6 +52,7 @@ ROLE_NAME_HINTS = {
     "Emission": ("emission", "emissive"),
 }
 NON_COLOR_ROLES = {"Normal", "Metallic", "Roughness", "AO"}
+FBX_ANIM_OFFSET = 1.0  # bpy.ops.wm.fbx_import default; Unity frame 0 -> Blender 1
 
 
 @dataclass
@@ -78,6 +82,21 @@ def target_collection(scene: bpy.types.Scene, pack: str) -> bpy.types.Collection
     return _child_collection(pack_col, library.MESHES)
 
 
+def unit_correction(scene: bpy.types.Scene) -> float:
+    """Import scale that cancels the scene's unit scale (FBX holds meters). Export needs none:
+    FBX_SCALE_ALL already writes scene units as meters."""
+    return 1.0 / scene.unit_settings.scale_length
+
+
+def unit_note(scene: bpy.types.Scene) -> str | None:
+    """Operator message when the scene unit scale isn't 1 (None otherwise)."""
+    scale = scene.unit_settings.scale_length
+    if scale == 1.0:
+        return None
+    correction = unit_correction(scene)
+    return f"Scene unit scale {scale:g}: FBX imported x{correction:g}, exported in meters"
+
+
 def _load(path: Path) -> tuple[list[bpy.types.Object], dict[bpy.types.Material, str]]:
     """Import path; returns new objects and each new material's name as stored in the file.
 
@@ -91,12 +110,27 @@ def _load(path: Path) -> tuple[list[bpy.types.Object], dict[bpy.types.Material, 
     try:
         ext = path.suffix.lower()
         if ext == ".fbx":
-            bpy.ops.wm.fbx_import(filepath=str(path))
+            scale = unit_correction(bpy.context.scene)
+            bpy.ops.wm.fbx_import(filepath=str(path), global_scale=scale)
         elif ext == ".obj":
-            bpy.ops.wm.obj_import(filepath=str(path), forward_axis="NEGATIVE_Z", up_axis="Y")
+            bpy.ops.wm.obj_import(
+                filepath=str(path),
+                forward_axis="NEGATIVE_Z",
+                up_axis="Y",
+                global_scale=unit_correction(bpy.context.scene),
+            )
         elif ext == ".blend":
             with bpy.data.libraries.load(str(path), link=False) as (src, dst):
                 dst.objects = src.objects
+                dst.scenes = src.scenes[:1]
+            blend_scale = 1.0
+            for scene in dst.scenes:
+                blend_scale = scene.unit_settings.scale_length * unit_correction(bpy.context.scene)
+                bpy.data.scenes.remove(scene)
+            if blend_scale != 1.0:
+                for obj in dst.objects:
+                    if obj.parent is None:
+                        obj.matrix_world = Matrix.Scale(blend_scale, 4) @ obj.matrix_world
         else:
             raise ValueError(f"Unsupported mesh type: {path.name}")
     finally:
@@ -350,7 +384,12 @@ def import_mesh(scene: bpy.types.Scene, path: Path, index: library.Index) -> Imp
     """Import a library mesh into `Pack > Meshes`, wire textures, and record its license."""
     pack = library.pack_of(index, path)
     images_before = set(bpy.data.images.keys())
+    actions_before = set(bpy.data.actions.keys())
     objects, source_names = _load(path)
+    new_actions = [bpy.data.actions[n] for n in set(bpy.data.actions.keys()) - actions_before]
+    if new_actions and path.suffix.lower() == ".fbx":
+        owner = next((o.name for o in objects if o.type == "ARMATURE"), path.stem)
+        log.info("%s: %s", path.name, apply_unity_clip_loops(path, new_actions, owner))
     result = ImportResult(objects)
     collection = target_collection(scene, pack)
     if any(LOD_NAME.search(o.name) for o in objects):  # keep a LOD set together
@@ -416,11 +455,204 @@ def _target_armature(
     return None
 
 
+def _action_fcurves(action: bpy.types.Action):
+    """Yield every F-Curve in a (layered) action."""
+    for layer in action.layers:
+        for strip in layer.strips:
+            for bag in strip.channelbags:
+                yield from bag.fcurves
+
+
+def _set_cycles(action: bpy.types.Action, ping_pong: bool) -> None:
+    """Make the action evaluate as a repeating cycle (Cycles F-Modifier on each curve)."""
+    mode = "MIRROR" if ping_pong else "REPEAT"
+    for fcurve in _action_fcurves(action):
+        cycles = next((m for m in fcurve.modifiers if m.type == "CYCLES"), None)
+        if cycles is None:
+            cycles = fcurve.modifiers.new(type="CYCLES")
+        cycles.mode_before = mode
+        cycles.mode_after = mode
+        cycles.cycles_before = 0  # infinite
+        cycles.cycles_after = 0
+
+
+def _replace_previous_actions(actions: list[bpy.types.Action]) -> None:
+    """Swap earlier imports of the same clips for the new ones so re-imports take effect."""
+    for action in actions:
+        base = _mat_name(action.name)
+        old = bpy.data.actions.get(base)
+        if old is not None and old != action:
+            old.user_remap(action)
+            bpy.data.actions.remove(old)
+            action.name = base
+
+
+def _clip_action(take: bpy.types.Action, clip: unity.ClipAnimation, name: str) -> bpy.types.Action:
+    """Copy of the whole-take action holding only this clip's keys, starting at frame 1."""
+    action = take.copy()
+    start = clip.first_frame + FBX_ANIM_OFFSET
+    end = clip.last_frame + FBX_ANIM_OFFSET
+    for fcurve in _action_fcurves(action):
+        for frame in (start, end):  # keep the curve's value at the clip edges
+            fcurve.keyframe_points.insert(frame, fcurve.evaluate(frame), options={"FAST"})
+        for point in reversed(fcurve.keyframe_points):
+            if not start <= point.co.x <= end:
+                fcurve.keyframe_points.remove(point, fast=True)
+        for point in fcurve.keyframe_points:
+            point.co.x -= start - FBX_ANIM_OFFSET
+            point.handle_left.x -= start - FBX_ANIM_OFFSET
+            point.handle_right.x -= start - FBX_ANIM_OFFSET
+        fcurve.update()
+    old = bpy.data.actions.get(name)
+    if old is not None:  # re-import: replace the earlier copy of this clip
+        old.user_remap(action)
+        bpy.data.actions.remove(old)
+    action.name = name
+    action.use_fake_user = True
+    return action
+
+
+def _split_takes(
+    actions: list[bpy.types.Action], clips: list[unity.ClipAnimation], owner: str
+) -> int:
+    """Replace each whole-take action that Unity splits into several clips with one action
+    per clip (`<owner>|<clip>`), in place in `actions`. Returns the number of clips made."""
+    takes = [clip.take_name for clip in clips]
+    made = 0
+    for take in [a for a in actions if takes.count(_mat_name(a.name)) > 1]:
+        parts = [
+            _clip_action(take, clip, f"{owner}|{clip.name}")
+            for clip in clips
+            if clip.take_name == _mat_name(take.name)
+        ]
+        take.user_remap(parts[0])
+        actions.remove(take)
+        bpy.data.actions.remove(take)
+        actions.extend(parts)
+        made += len(parts)
+    return made
+
+
+def apply_unity_clip_loops(path: Path, actions: list[bpy.types.Action], owner: str) -> str:
+    """Map ModelImporter clipAnimations loop settings onto matching Blender actions.
+
+    Matches actions by Unity takeName (FBX import names, ignoring `.001`). A take that Unity
+    splits into several clips becomes one action per clip named `<owner>|<clip name>` (the
+    whole-take action is removed; `actions` is updated in place). Sets manual frame range from
+    firstFrame/lastFrame (plus FBX_ANIM_OFFSET). Looping clips get use_cyclic and a Cycles
+    F-Modifier so playback repeats. Raises if the .meta or required fields are missing, or if
+    no action matches a clip.
+    """
+    if not actions:
+        return "0 actions"
+    meta = path.with_name(path.name + unity.META_SUFFIX)
+    clips = unity.clip_animations(meta)
+    split = _split_takes(actions, clips, owner)
+    by_take = {clip.take_name: clip for clip in clips}
+    by_name = {f"{owner}|{clip.name}": clip for clip in clips}
+    applied = cyclic = 0
+    for action in actions:
+        if clip := by_take.get(_mat_name(action.name)):  # re-imports arrive as `.001`
+            first, last = clip.first_frame, clip.last_frame
+        elif clip := by_name.get(action.name):
+            first, last = 0.0, clip.last_frame - clip.first_frame  # split clips start at 1
+        else:
+            continue
+        action.use_frame_range = True
+        action.frame_start = first + FBX_ANIM_OFFSET
+        action.frame_end = last + FBX_ANIM_OFFSET
+        action.use_cyclic = clip.loops
+        applied += 1
+        if clip.loops:
+            _set_cycles(action, clip.ping_pong)
+            cyclic += 1
+    if not applied:
+        raise ValueError(f"{path.name}: no action matches a clipAnimations takeName in the .meta")
+    unmatched = len(actions) - applied
+    return (
+        f"{cyclic} looping / {applied} ranged of {len(actions)} actions"
+        f" ({len(clips)} clips in .meta"
+        + (f", {split} split from shared takes" if split else "")
+        + (f", {unmatched} unmatched" if unmatched else "")
+        + ")"
+    )
+
+
+EMPTY_RIG_MATCH = 0.9  # share of an armature's bones an empties-only rig must name
+
+
+def _armature_for_empties(
+    empties: list[bpy.types.Object], existing: list[bpy.types.Object]
+) -> bpy.types.Object | None:
+    """Scene armature whose bones the empties name (some FBX rigs store bones as Null nodes)."""
+    names = {_mat_name(o.name) for o in empties}
+    matches = [a for a in existing if len(_bones(a) & names) >= EMPTY_RIG_MATCH * len(a.data.bones)]
+    if len(matches) > 1:
+        found = ", ".join(a.name for a in matches)
+        raise ValueError(f"several armatures match this rig ({found}); keep one in the scene")
+    return matches[0] if matches else None
+
+
+def _bake_onto_armature(
+    empties: list[bpy.types.Object], armature: bpy.types.Object
+) -> list[bpy.types.Action]:
+    """Bake the empties' animation onto the armature's pose bones (and the root empty's onto
+    the armature object) by copying world transforms frame by frame. Returns the new action,
+    named after the take."""
+    from bpy_extras import anim_utils
+
+    takes = {e.animation_data.action for e in empties if e.animation_data}
+    takes.discard(None)
+    if len(takes) != 1:
+        raise ValueError(f"empties-only rig with {len(takes)} takes; expected exactly one")
+    take = takes.pop()
+    by_name = {_mat_name(e.name): e for e in empties}
+    added = []
+    for bone in armature.pose.bones:
+        if source := by_name.get(bone.name):
+            added.append((bone, bone.constraints.new("COPY_TRANSFORMS")))
+            added[-1][1].target = source
+    root = by_name.get(_mat_name(armature.name))
+    if root is not None:
+        added.append((armature, armature.constraints.new("COPY_TRANSFORMS")))
+        added[-1][1].target = root
+    anim = armature.animation_data or armature.animation_data_create()
+    previous = anim.action, anim.action_slot
+    options = anim_utils.BakeOptions(
+        only_selected=False,
+        do_pose=True,
+        do_object=root is not None,
+        do_visual_keying=True,
+        do_constraint_clear=False,
+        do_parents_clear=False,
+        do_clean=False,
+        do_location=True,
+        do_rotation=True,
+        do_scale=True,
+        do_bbone=False,
+        do_custom_props=False,
+    )
+    start, end = take.frame_range
+    try:
+        baked = anim_utils.bake_action(
+            armature, action=None, frames=range(int(start), int(end) + 1), bake_options=options
+        )
+    finally:
+        for owner, constraint in added:
+            owner.constraints.remove(constraint)
+        anim.action = previous[0]
+        if previous[0]:
+            anim.action_slot = previous[1]
+    baked.name = take.name
+    return [baked]
+
+
 def import_animation(
     scene: bpy.types.Scene, path: Path, index: library.Index
 ) -> tuple[str, ImportResult]:
     """Add the file's actions to the matching scene armature without a second mesh;
-    full mesh import if no armature matches. Returns (what happened, result)."""
+    full mesh import if no armature matches. A rig stored as empties (Null nodes) is baked onto
+    the scene armature whose bones it names. Returns (what happened, result)."""
     existing = [o for o in scene.objects if o.type == "ARMATURE"]
     kinds = ("objects", "meshes", "armatures", "materials", "images", "actions")
     before = {k: set(getattr(bpy.data, k).keys()) for k in kinds}
@@ -430,8 +662,14 @@ def import_animation(
         for k in kinds
     }
     armatures = [o for o in objects if o.type == "ARMATURE"]
+    empty_rig = bool(objects) and all(o.type == "EMPTY" for o in objects)
     try:
-        target = _target_armature(armatures[0], existing) if len(armatures) == 1 else None
+        if empty_rig and (target := _armature_for_empties(objects, existing)):
+            baked = _bake_onto_armature(objects, target)
+            bpy.data.batch_remove([i for k in kinds for i in new[k]])
+            new = {k: [] for k in kinds} | {"actions": baked}
+        else:
+            target = _target_armature(armatures[0], existing) if len(armatures) == 1 else None
     except ValueError:
         bpy.data.batch_remove([i for k in kinds for i in new[k]])
         raise
@@ -444,12 +682,15 @@ def import_animation(
     bpy.data.batch_remove([i for k in kinds[:-1] for i in new[k]])
     for action in actions:
         action.use_fake_user = True  # keep every clip, not only the assigned one
-    if actions:
-        anim = target.animation_data or target.animation_data_create()
-        anim.action = actions[0]
-        if actions[0].slots and anim.action_slot is None:
-            anim.action_slot = actions[0].slots[0]
-    return f"{len(actions)} actions added to {target.name}", ImportResult()
+    _replace_previous_actions(actions)
+    loops = apply_unity_clip_loops(path, actions, target.name)
+    anim = target.animation_data or target.animation_data_create()
+    if actions and anim.action is None:  # keep the clip a re-import just replaced
+        first = min(actions, key=lambda a: (not a.use_cyclic, a.name))  # show a loop if any
+        anim.action = first
+        if first.slots and anim.action_slot is None:
+            anim.action_slot = first.slots[0]
+    return f"{len(actions)} actions added to {target.name}; {loops}", ImportResult()
 
 
 def import_material(
@@ -611,13 +852,194 @@ def _assert_png_has_alpha(path: Path, label: str) -> None:
         bpy.data.images.remove(img)
 
 
-def _copy_library_texture_meta(src: Path | None, dst: Path) -> None:
-    """Copy the library texture's .meta beside dst (keeps alphaIsTransparency)."""
-    if src is None:
-        return
-    meta_src = Path(str(src) + unity.META_SUFFIX)
-    if meta_src.is_file():
-        shutil.copy2(meta_src, Path(str(dst) + unity.META_SUFFIX))
+LINEAR_ROLES = {"Metallic", "Roughness", "AO"}  # data maps: never sRGB
+NORMAL_TEXTURE_TYPE = 1  # TextureImporter textureType for normal maps
+
+
+def _write_texture_meta(src: Path | None, dst: Path, role: str) -> str:
+    """Write dst's .meta: the library texture's import settings when there are any (keeps
+    alphaIsTransparency, normal type), else minimal ones for the role. Data maps are made
+    linear. The GUID is dst's own (kept across re-exports), so textures shared by several
+    assets don't clash with each other or the library. Returns the GUID."""
+    meta_src = Path(str(src) + unity.META_SUFFIX) if src else None
+    if meta_src and meta_src.is_file():
+        text, count = re.subn(
+            r"(?m)^(fileFormatVersion|guid): .*\n", "", meta_src.read_text("utf-8")
+        )
+        if count != 2:
+            raise ValueError(f"{meta_src.name}: expected fileFormatVersion and guid lines")
+    else:
+        text = "TextureImporter:\n"
+        if role == "Normal":
+            text += f"  textureType: {NORMAL_TEXTURE_TYPE}\n"
+        if role in LINEAR_ROLES:
+            text += "  mipmaps:\n    sRGBTexture: 0\n"
+    if role in LINEAR_ROLES:
+        text = re.sub(r"(?m)^(\s+sRGBTexture:) 1$", r"\g<1> 0", text)
+    return unity.write_asset_meta(Path(str(dst) + unity.META_SUFFIX), text)
+
+
+SHADERS_DIR = "Shaders"
+BUILTIN_GUID_PREFIX = "0000000000000000"  # Unity built-in resources (Standard shader...)
+
+
+def _bsdf_mat_text(material: bpy.types.Material) -> str:
+    """Pseudo .mat text from a Principled BSDF, for materials without a Unity source."""
+    bsdf = next(
+        (
+            n
+            for n in (material.node_tree.nodes if material.node_tree else ())
+            if n.type == "BSDF_PRINCIPLED"
+        ),
+        None,
+    )
+    if bsdf is None:
+        r, g, b, a = material.diffuse_color
+        return f"_Color: {{r: {r}, g: {g}, b: {b}, a: {a}}}\n_Glossiness: 0.5\n"
+    value = {i.name: i.default_value for i in bsdf.inputs if hasattr(i, "default_value")}
+    r, g, b, a = value["Base Color"]
+    return (
+        f"_Color: {{r: {r}, g: {g}, b: {b}, a: {value['Alpha']}}}\n"
+        f"_Metallic: {value['Metallic']}\n_Glossiness: {1 - value['Roughness']}\n"
+    )
+
+
+def _assets_dir(path: Path) -> Path:
+    for parent in path.resolve().parents:
+        if parent.name == "Assets":
+            return parent
+    raise ValueError(f"{path} is not inside a Unity project's Assets folder")
+
+
+def _ship_shader(files: list[Path], pack_dir: Path, ship_dir: Path) -> None:
+    """Copy shader files (with their .meta, so GUIDs match the material) into ship_dir,
+    unless the target project already has that shader."""
+    guid = unity.meta_guid(Path(str(files[0]) + unity.META_SUFFIX))
+    assets = _assets_dir(ship_dir)
+    for suffix in unity.SHADER_SUFFIXES:
+        for meta in assets.rglob(f"*{suffix}{unity.META_SUFFIX}"):
+            if (
+                not meta.resolve().is_relative_to(ship_dir.resolve())
+                and unity.meta_guid(meta) == guid
+            ):
+                return
+    for src in files:
+        dst = ship_dir / src.resolve().relative_to(pack_dir.resolve())
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        shutil.copy2(str(src) + unity.META_SUFFIX, str(dst) + unity.META_SUFFIX)
+
+
+def _copy_library_texture(src: Path, dest_stem: Path, role: str) -> str:
+    """Bring a library texture the Blender material doesn't use (custom-shader inputs)."""
+    image = bpy.data.images.load(str(src), check_existing=False)
+    try:
+        return _write_export_texture(image, dest_stem, role=role)[1]
+    finally:
+        bpy.data.images.remove(image)
+
+
+def _export_materials(
+    out_dir: Path,
+    fbx_names: dict[bpy.types.Material, str],
+    textures: dict[tuple, str],
+    asset: str,
+    library_root: Path | None,
+) -> tuple[dict[str, str], list[str]]:
+    """Write a .mat per material: the source material with its URP pack shader shipped when
+    that shader compiles under URP, else URP Lit. Textures the source .mat references but
+    Blender didn't export are copied from the library. An existing .mat keeps everything
+    but its texture references. Returns FBX material name -> .mat GUID, and notes."""
+    remaps: dict[str, str] = {}
+    notes: list[str] = []
+    every: dict[str, Path] = {}  # whole-library GUID index, built when a pack lacks a file
+
+    def find(index: dict[str, Path], guid: str) -> Path | None:
+        if guid not in index and not every and library_root:
+            every.update(unity.guid_index(library_root / "Assets"))
+        return index.get(guid) or every.get(guid)
+
+    for material, fbx_name in fbx_names.items():
+        exported = {role: g for (m, role), g in textures.items() if m == material}
+        source = material.get(SOURCE_PROPERTY)
+        if not source:
+            stem = bpy.path.clean_name(fbx_name)
+            text = unity.lit_material(
+                fbx_name,
+                _bsdf_mat_text(material),
+                {r: g for r, g in exported.items() if r in unity.LIT_SLOTS},
+            )
+        else:
+            source_mat = Path(source)
+            if not source_mat.is_file():
+                raise ValueError(f"{material.name}: source material not found: {source_mat}")
+            if library_root is None:
+                raise ValueError(f"{material.name}: no library set for its source material")
+            stem = source_mat.stem
+            pack_dir = (
+                library_root
+                / "Assets"
+                / source_mat.resolve().relative_to((library_root / "Assets").resolve()).parts[0]
+            )
+            index = unity.guid_index(pack_dir)
+            source_text = source_mat.read_text(encoding="utf-8", errors="replace")
+            tinted = _foliage_tint_srgb(material) is not None
+            shader_guid = unity.shader_guid(source_mat) or ""
+            builtin = shader_guid.startswith(BUILTIN_GUID_PREFIX)
+            shader = None if builtin else find(index, shader_guid)
+            files = unity.urp_shader_files(shader, index) if shader else None
+            if shader and files is None and library_root:  # dependencies in another pack?
+                every.update(every or unity.guid_index(library_root / "Assets"))
+                files = unity.urp_shader_files(shader, every)
+            mapping: dict[str, str] = {}  # library texture GUID -> exported GUID
+            for prop, guid in unity.texture_refs(source_text).items():
+                role = unity.TEXTURE_SLOTS.get(prop, "")
+                if files is None and role not in unity.LIT_SLOTS:
+                    continue
+                if role in exported and not (files and tinted and role == "BaseColor"):
+                    mapping[guid] = exported[role]
+                elif guid not in mapping:
+                    src = find(index, guid)
+                    if src is None:  # dangling in the library too: Unity shows no texture
+                        notes.append(f"{stem}: {prop} texture missing from the library; left empty")
+                        mapping[guid] = ""
+                    else:
+                        mapping[guid] = _copy_library_texture(
+                            src, out_dir / f"{asset}_{stem}{prop}", role
+                        )
+                if files is None and mapping[guid]:
+                    exported.setdefault(role, mapping[guid])
+            if files:
+                _ship_shader(files, library_root / "Assets", out_dir.parent / SHADERS_DIR)
+                text = unity.set_texture_refs(
+                    source_text,
+                    {p: mapping[g] for p, g in unity.texture_refs(source_text).items()},
+                )
+                # a variant's parent stays in the library: keep it as a plain material
+                text = re.sub(r"(?m)^(  m_Parent: )\{[^}]*\}", r"\1{fileID: 0}", text)
+            else:
+                if not builtin:
+                    name = shader.name if shader else f"{shader_guid} (not in library)"
+                    notes.append(f"{stem}: shader {name} isn't URP-ready; used URP Lit")
+                text = unity.lit_material(
+                    stem,
+                    source_mat,
+                    {r: g for r, g in exported.items() if r in unity.LIT_SLOTS},
+                    color_baked=tinted,
+                )
+        mat_path = out_dir / MATERIALS_DIR / f"{stem}.mat"
+        mat_path.parent.mkdir(exist_ok=True)
+        if mat_path.is_file():  # keep edits made in Unity; refresh texture refs only
+            current = mat_path.read_text(encoding="utf-8")
+            text = unity.set_texture_refs(current, unity.texture_refs(text))
+            if text != current:
+                mat_path.write_text(text, "utf-8")
+        else:
+            mat_path.write_text(text, "utf-8")
+        remaps[fbx_name] = unity.write_asset_meta(
+            Path(str(mat_path) + unity.META_SUFFIX), NATIVE_IMPORTER_META
+        )
+    return remaps, notes
 
 
 def _write_export_texture(
@@ -626,13 +1048,15 @@ def _write_export_texture(
     tint_srgb: tuple[float, float, float] | None = None,
     *,
     require_alpha: bool = False,
-) -> Path:
+    role: str = "",
+) -> tuple[Path, str]:
     """Write image beside the FBX; copy PNG/JPEG, otherwise convert to PNG from disk.
 
     Prefers the absolute library filepath over the scene image buffer (PSD often has no
     loaded pixels). tint_srgb replaces RGB (keeps alpha) so foliage leaf masks export
     green for Lit, matching ASFolliage _Color0 when the custom shader is not applied yet.
     require_alpha verifies the written PNG has varying alpha (foliage masks).
+    Returns the written path and its .meta GUID.
     """
     src = _disk_texture_path(image)
     ext = src.suffix.lower() if src else ""
@@ -667,8 +1091,7 @@ def _write_export_texture(
             other.unlink(missing_ok=True)
             meta = Path(str(other) + unity.META_SUFFIX)
             meta.unlink(missing_ok=True)
-    _copy_library_texture_meta(src, dst)
-    return dst
+    return dst, _write_texture_meta(src, dst, role)
 
 
 def _rename_to_source_mats(objects: list[bpy.types.Object]) -> list[tuple[bpy.types.Material, str]]:
@@ -754,6 +1177,66 @@ def _unity_values(objects: list[bpy.types.Object], asset: str) -> dict:
     return out
 
 
+def _strip_take_prefixes(objects: list[bpy.types.Object]) -> dict[bpy.types.Action, str]:
+    """Drop a leading `<Object>|` from action names, since the FBX exporter prefixes the object
+    name to every take (`Arm_Cat|Arm_Cat|Idle` otherwise). Returns original names to restore."""
+    prefixes = tuple(f"{o.name}|" for o in objects if o.animation_data)
+    saved: dict[bpy.types.Action, str] = {}
+    for action in bpy.data.actions:
+        prefix = next((p for p in prefixes if action.name.startswith(p)), None)
+        if prefix is None:
+            continue
+        saved[action] = original = action.name
+        action.name = original[len(prefix) :]
+        if action.name != original[len(prefix) :]:
+            _restore_action_names(saved)
+            raise ValueError(f"Can't export {original}: another action is named {action.name}")
+    return saved
+
+
+def _restore_action_names(saved: dict[bpy.types.Action, str]) -> None:
+    for action, name in saved.items():
+        action.name = name
+
+
+def _fbx_take_names(fbx: Path) -> list[str]:
+    """AnimStack (take) names Unity will see in an FBX written by Blender."""
+    from io_scene_fbx import parse_fbx  # bundled with Blender, like the FBX exporter itself
+    from io_scene_fbx.fbx_utils import FBX_NAME_CLASS_SEP
+
+    root, _ = parse_fbx.parse(str(fbx))
+    objects = next(e for e in root.elems if e.id == b"Objects")
+    stacks = (e for e in objects.elems if e.id == b"AnimationStack")
+    return [e.props[1].split(FBX_NAME_CLASS_SEP)[0].decode() for e in stacks]
+
+
+def _export_clips(objects: list[bpy.types.Object], takes: list[str]) -> list[unity.ClipAnimation]:
+    """Unity clip settings per exported take: range from the action (FBX takes start at 0),
+    looping from the action's Cyclic Animation flag."""
+    owners = [o.name for o in objects if o.animation_data]
+    clips = []
+    for take in takes:
+        owner = next((n for n in owners if take.startswith(f"{n}|")), None)
+        action = bpy.data.actions.get(take)
+        if action is None and owner is not None:
+            action = bpy.data.actions.get(take[len(owner) + 1 :])
+        if action is None:
+            raise ValueError(f"FBX take {take} has no matching Blender action")
+        start, end = action.frame_range
+        clips.append(
+            unity.ClipAnimation(
+                name=take.split("|")[-1],
+                take_name=take,
+                first_frame=0.0,
+                last_frame=end - start,
+                wrap_mode=unity.WRAP_LOOP if action.use_cyclic else unity.WRAP_DEFAULT,
+                loop=action.use_cyclic,
+                loop_time=action.use_cyclic,
+            )
+        )
+    return clips
+
+
 def export_dir(target: Path, root: str, asset: str) -> Path:
     return target / root / asset
 
@@ -786,27 +1269,39 @@ def copy_library_file(src: Path, dest: Path, library_root: Path) -> list[Path]:
 def export_asset(
     objects: list[bpy.types.Object], out_dir: Path, asset: str, library_root: Path | None
 ) -> list[str]:
-    """Write FBX, named textures, and ATTRIBUTION.md into out_dir; returns warnings."""
+    """Write FBX (plus clip settings in its .meta), named textures, and ATTRIBUTION.md into
+    out_dir; returns warnings."""
     if library_root and out_dir.resolve().is_relative_to(library_root.resolve()):
         raise ValueError("Refusing to export into the library project")
+    if not objects:
+        raise ValueError(f"{asset}: nothing to export (empty collection)")
     out_dir.mkdir(parents=True, exist_ok=True)
     original_paths = {}
     saved_links: list[tuple] = []
     saved_names: list[tuple[bpy.types.Material, str]] = []
+    saved_actions: dict[bpy.types.Action, str] = {}
+    fbx = out_dir / f"{asset}.fbx"
+    texture_guids: dict[tuple, str] = {}
+    fbx_names: dict[bpy.types.Material, str] = {}
     try:
         for image, name, material, role in _texture_jobs(objects, asset):
             tint = _foliage_tint_srgb(material) if role == "BaseColor" else None
-            dst = _write_export_texture(
-                image, out_dir / name, tint_srgb=tint, require_alpha=tint is not None
+            dst, guid = _write_export_texture(
+                image, out_dir / name, tint_srgb=tint, require_alpha=tint is not None, role=role
             )
+            texture_guids[(material, role)] = guid
             original_paths[image] = image.filepath
             image.filepath = str(dst)
             if image.alpha_mode == "NONE" and tint is not None:
                 image.alpha_mode = "STRAIGHT"
         saved_links = _foliage_export_links(objects)
         saved_names = _rename_to_source_mats(objects)
+        fbx_names = {
+            s.material: s.material.name for o in objects for s in o.material_slots if s.material
+        }
+        saved_actions = _strip_take_prefixes(objects)
         bpy.ops.export_scene.fbx(
-            filepath=str(out_dir / f"{asset}.fbx"),
+            filepath=str(fbx),
             use_selection=True,
             apply_scale_options="FBX_SCALE_ALL",
             axis_forward="-Z",
@@ -816,10 +1311,15 @@ def export_asset(
             embed_textures=False,
         )
     finally:
+        _restore_action_names(saved_actions)
         _restore_names(saved_names)
         _restore_links(saved_links)
         for image, path in original_paths.items():
             image.filepath = path
+    clips = _export_clips(objects, _fbx_take_names(fbx))
+    remaps, notes = _export_materials(out_dir, fbx_names, texture_guids, asset, library_root)
+    if clips or remaps:
+        unity.write_model_meta(fbx.with_name(fbx.name + unity.META_SUFFIX), clips, remaps)
     if values := _unity_values(objects, asset):
         (out_dir / f"{asset}.materials.json").write_text(json.dumps(values, indent=2), "utf-8")
     records = records_of(objects)
@@ -827,5 +1327,8 @@ def export_asset(
         licensing.attribution_markdown(asset, records), encoding="utf-8"
     )
     if not records:
-        return [f"{asset}: no license record ({licensing.UNKNOWN})"]
-    return [f"{r.pack}: {r.license} (check terms)" for r in licensing.restrictive(records)]
+        return [*notes, f"{asset}: no license record ({licensing.UNKNOWN})"]
+    return [
+        *notes,
+        *(f"{r.pack}: {r.license} (check terms)" for r in licensing.restrictive(records)),
+    ]

@@ -196,6 +196,8 @@ class BAT_OT_import(bpy.types.Operator, ImportHelper):
         except (OSError, ValueError, RuntimeError) as error:
             self.report({"ERROR"}, str(error))
             return {"CANCELLED"}
+        if note := io.unit_note(context.scene):
+            self.report({"INFO"}, note)
         for problem in result.unresolved:
             self.report({"WARNING"}, problem)
         for line in result.relinked:
@@ -564,6 +566,8 @@ class BAT_OT_export_staged(bpy.types.Operator):
             parts.append(f"{collections} collection(s)")
         if files:
             parts.append(f"{files} file(s)")
+        if note := io.unit_note(context.scene):
+            self.report({"INFO"}, note)
         self.report({"INFO"}, f"Exported {', '.join(parts) or 'nothing'}")
         return {"FINISHED"}
 
