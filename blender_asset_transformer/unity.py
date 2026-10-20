@@ -181,6 +181,7 @@ class ClipAnimation:
     wrap_mode: int
     loop: bool
     loop_time: bool
+    root_motion: tuple[tuple[str, str], ...] = ()  # source clip's root motion fields
 
     @property
     def loops(self) -> bool:
@@ -245,6 +246,7 @@ def _clip_values(clip: ClipAnimation) -> dict[str, str]:
         "wrapMode": str(clip.wrap_mode),
         "loop": str(int(clip.loop)),
         "loopTime": str(int(clip.loop_time)),
+        **dict(clip.root_motion),
     }
 
 
@@ -326,7 +328,11 @@ def merge_clip_animations(text: str, clips: list[ClipAnimation], label: str) -> 
         if clip and (take not in split or take in cut):
             for key, value in _clip_values(clip).items():
                 entry, count = re.subn(rf"(?m)^( *{key}): .*$", rf"\g<1>: {value}", entry, 1)
-                if not count:
+                if not count and key in ROOT_MOTION_FIELDS:  # minimal .meta: add the field
+                    entry = re.sub(
+                        r"(?m)^( *)(takeName: .*)$", rf"\g<1>\g<2>\n\g<1>{key}: {value}", entry, 1
+                    )
+                elif not count:
                     raise ValueError(f"{label}: clip {clip.take_name} has no {key} field")
         updated.append(entry)
     updated += [_clip_entry(clip, indent) for clip in [*by_take.values(), *by_cut.values()]]
@@ -334,13 +340,15 @@ def merge_clip_animations(text: str, clips: list[ClipAnimation], label: str) -> 
     return head + "".join(updated) + text[end:]
 
 
-def write_model_meta(meta: Path, clips: list[ClipAnimation], remaps: dict[str, str]) -> None:
-    """Create the model .meta with these clips and material remaps, or merge them into the
-    existing one (GUID and every other field kept)."""
+def write_model_meta(
+    meta: Path, clips: list[ClipAnimation], remaps: dict[str, str], rig: dict[str, str] | None
+) -> None:
+    """Create the model .meta with these clips, material remaps and rig settings, or merge
+    them into the existing one (GUID and every other field kept)."""
     if not meta.is_file():
-        meta.write_text(new_model_meta(clips, remaps), encoding="utf-8")
+        meta.write_text(apply_rig(new_model_meta(clips, remaps), rig or {}), encoding="utf-8")
         return
-    text = meta.read_text(encoding="utf-8")
+    text = apply_rig(meta.read_text(encoding="utf-8"), rig or {})
     if clips:
         text = merge_clip_animations(text, clips, meta.name)
     if remaps:
@@ -594,3 +602,100 @@ def urp_shader_files(shader: Path, index: dict[str, Path]) -> list[Path] | None:
                     return None
                 todo.append(dep)
     return files
+
+
+ROOT_MOTION_FIELDS = (
+    "orientationOffsetY",
+    "level",
+    "cycleOffset",
+    "loopBlend",
+    "loopBlendOrientation",
+    "loopBlendPositionY",
+    "loopBlendPositionXZ",
+    "keepOriginalOrientation",
+    "keepOriginalPositionY",
+    "keepOriginalPositionXZ",
+    "heightFromFeet",
+    "mirror",
+)
+ANIMATION_GENERIC, ANIMATION_HUMANOID = 2, 3
+AVATAR_CREATE, AVATAR_COPY = 1, 2
+
+
+def clip_root_motion(meta_text: str, clip_name: str) -> tuple[tuple[str, str], ...]:
+    """Root motion fields of the named clip in a model .meta (empty if the clip is absent)."""
+    for entry in re.split(r"(?m)^ *- serializedVersion: \d+\n", meta_text)[1:]:
+        name = re.search(r"^ *name: (.*)$", entry, re.M)
+        if name and _yaml_str(name.group(1)) == clip_name and "takeName:" in entry:
+            return tuple(
+                (key, m.group(1).strip())
+                for key in ROOT_MOTION_FIELDS
+                if (m := re.search(rf"^ *{key}: (.*)$", entry, re.M))
+            )
+    return ()
+
+
+def _block(text: str, key: str, indent: str) -> re.Match | None:
+    """`key:` at this indent plus its deeper-indented lines."""
+    return re.search(rf"(?m)^{indent}{key}:.*\n(?:{indent} .*\n)*", text)
+
+
+def rig_settings(meta_text: str) -> dict[str, str]:
+    """animationType, avatarSetup and humanDescription (as text) of a model .meta."""
+    rig: dict[str, str] = {}
+    for key in ("animationType", "avatarSetup"):
+        if m := re.search(rf"(?m)^  {key}: (\d+)$", meta_text):
+            rig[key] = m.group(1)
+    if block := _block(meta_text, "humanDescription", "  "):
+        rig["humanDescription"] = block.group(0)
+    return rig
+
+
+def check_rig(rig: dict[str, str], names: set[str], label: str) -> list[str]:
+    """Raise if the rig names bones or objects the export doesn't have; returns notes.
+    A copied avatar (avatarSetup 2) points into the library, so the model makes its own."""
+    notes = []
+    human = rig.get("humanDescription", "")
+    wanted = set(re.findall(r"(?m)^ *(?:boneName|name|rootMotionBoneName): (\S.*)$", human))
+    if rig.get("animationType") != str(ANIMATION_HUMANOID):  # Generic: only the root bone
+        wanted = set(re.findall(r"(?m)^ *rootMotionBoneName: (\S.*)$", human))
+    if missing := sorted(_yaml_str(n) for n in wanted if _yaml_str(n) not in names):
+        raise ValueError(f"{label}: source rig names {', '.join(missing[:5])}, not in the export")
+    if "avatarSetup" not in rig and rig.get("animationType") in (
+        str(ANIMATION_GENERIC),
+        str(ANIMATION_HUMANOID),
+    ):  # older .meta files leave it out; Unity then creates an avatar from the model
+        rig["avatarSetup"] = str(AVATAR_CREATE)
+    if rig.get("avatarSetup") == str(AVATAR_COPY):
+        rig["avatarSetup"] = str(AVATAR_CREATE)
+        notes.append(f"{label}: source copies a library avatar; the model creates its own")
+    return notes
+
+
+def apply_rig(meta_text: str, rig: dict[str, str]) -> str:
+    """Set animationType, avatarSetup and humanDescription; Generic rigs only take the root
+    motion bone so an edited description keeps its other fields."""
+    text = meta_text if meta_text.endswith("\n") else meta_text + "\n"
+    for key in ("animationType", "avatarSetup"):
+        if key in rig:
+            text, count = re.subn(rf"(?m)^(  {key}): .*$", rf"\g<1>: {rig[key]}", text, 1)
+            if not count:
+                text += f"  {key}: {rig[key]}\n"
+    human = rig.get("humanDescription")
+    if not human:
+        return text
+    if rig.get("animationType") == str(ANIMATION_HUMANOID):
+        block = _block(text, "humanDescription", "  ")
+        return text[: block.start()] + human + text[block.end() :] if block else text + human
+    root = re.search(r"(?m)^ *rootMotionBoneName: (.*)$", human)
+    if root is None:
+        return text
+    block = _block(text, "humanDescription", "  ")
+    if block is None:
+        return text + f"  humanDescription:\n    rootMotionBoneName: {root.group(1)}\n"
+    body, count = re.subn(
+        r"(?m)^(    rootMotionBoneName): .*$", rf"\g<1>: {root.group(1)}", block.group(0), 1
+    )
+    if not count:
+        body += f"    rootMotionBoneName: {root.group(1)}\n"
+    return text[: block.start()] + body + text[block.end() :]

@@ -1,6 +1,7 @@
 # Changelog
 
 ## 0.1.0 - Unreleased
+- Animation export: when an asset and all its clips come from one library model, the FBX `.meta` gets that model's rig settings (animation type, avatar setup, root motion bone; for Humanoid, the full human description) and each clip's root motion settings (keep original position/orientation, loop blend, offsets, mirror), so root motion behaves as in the source. Re-export updates only these fields. A rig naming bones the export lacks fails with a clear message; a source whose avatar is copied from another model is left as before, with a note.
 - Animation export: clips that were cut from one take moving several objects (for example an egg and its 17 shards) export back as that one take, laid end to end, with `.meta` clips cutting it by frame range under their original names and loop settings, so each clip moves all parts together in Unity. Blender keeps one action per clip. Re-export recomputes the ranges from the current action lengths and updates only those clips. A deleted or renamed clip action fails with a clear message.
 - Import: a uniform scale on an imported model's top objects (0.01 for FBX in centimeters) is folded into the mesh and armature data and every location below it, keyed ones included, so exported models show scale 1 in Unity with the same size and motion. Non-uniform scales, constraints and non-armature modifiers fail with a clear message.
 - Export: only the exported objects' own actions become FBX takes, so clips of other assets in the same scene no longer leak in.

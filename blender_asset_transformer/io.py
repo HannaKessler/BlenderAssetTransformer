@@ -6,7 +6,7 @@ import logging
 import math
 import re
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import bpy
@@ -519,6 +519,7 @@ def import_mesh(scene: bpy.types.Scene, path: Path, index: library.Index) -> Imp
             col.objects.unlink(obj)
         collection.objects.link(obj)
         obj[licensing.PROPERTY] = licensing.dumps([record])
+        obj[SOURCE_MODEL_PROPERTY] = str(path)
         for slot in obj.material_slots:
             if slot.material in source_names and slot.material not in done:
                 done.add(slot.material)
@@ -625,6 +626,9 @@ def _clip_action(take: bpy.types.Action, clip: unity.ClipAnimation, name: str) -
     return action
 
 
+SOURCE_MODEL_PROPERTY = "bat_source_model"  # library model an object came from (rig settings)
+SOURCE_META_PROPERTY = "bat_source_meta"  # model .meta an action's clip settings came from
+SOURCE_CLIP_PROPERTY = "bat_source_clip"  # that clip's name there
 TAKE_PROPERTY = "bat_take"  # source take a clip action was cut from (multi-object takes)
 TAKE_CLIPS_PROPERTY = "bat_take_clips"  # every clip action cut from that take, in order
 CLIP_PROPERTY = "bat_clip"  # the clip's name in Unity
@@ -682,6 +686,8 @@ def apply_unity_clip_loops(path: Path, actions: list[bpy.types.Action], owner: s
         action.frame_start = first + FBX_ANIM_OFFSET
         action.frame_end = last + FBX_ANIM_OFFSET
         action.use_cyclic = clip.loops
+        action[SOURCE_META_PROPERTY] = str(meta)  # root motion settings for export
+        action[SOURCE_CLIP_PROPERTY] = clip.name
         applied += 1
         if clip.loops:
             _set_cycles(action, clip.ping_pong)
@@ -1351,6 +1357,50 @@ def _pop_takes(undo: list) -> None:
             item.mute = False
 
 
+def _root_motion(clip: unity.ClipAnimation, action: bpy.types.Action) -> unity.ClipAnimation:
+    """The clip with its source clip's root motion settings, when it came from the library."""
+    meta = action.get(SOURCE_META_PROPERTY)
+    if not meta or not Path(meta).is_file():
+        return clip
+    text = Path(meta).read_text(encoding="utf-8", errors="replace")
+    return replace(clip, root_motion=unity.clip_root_motion(text, action[SOURCE_CLIP_PROPERTY]))
+
+
+def _rig(
+    objects: list[bpy.types.Object], asset: str, clips: list[unity.ClipAnimation]
+) -> tuple[dict[str, str] | None, list[str]]:
+    """Rig settings of the library model the objects and all their clips came from; raises
+    if several models disagree. None (with a note) when the clips come from another file or
+    the source copies an avatar from elsewhere in the library: that avatar isn't exported."""
+    sources = {o[SOURCE_MODEL_PROPERTY] for o in objects if o.get(SOURCE_MODEL_PROPERTY)}
+    clip_metas = {
+        a.get(SOURCE_META_PROPERTY)
+        for o in objects
+        if o.animation_data
+        for a in bpy.data.actions
+        if _owned_slot(a, o)
+    }
+    if not clips or clip_metas != {p + unity.META_SUFFIX for p in sources}:
+        return None, []
+    rigs = []
+    for path in sorted(sources):
+        meta = Path(path + unity.META_SUFFIX)
+        if meta.is_file():
+            rigs.append(unity.rig_settings(meta.read_text(encoding="utf-8", errors="replace")))
+    if not rigs:
+        return None, []
+    if any(r != rigs[0] for r in rigs):
+        raise ValueError(f"{asset}: its source models have different rig settings")
+    if rigs[0].get("avatarSetup") == str(unity.AVATAR_COPY):
+        return None, [f"{asset}: source avatar is copied from another model; rig not carried"]
+    names = {o.name for o in objects} | {b.name for o in objects for b in _bone_list(o)}
+    return rigs[0], unity.check_rig(rigs[0], names, asset)
+
+
+def _bone_list(obj: bpy.types.Object) -> list:
+    return list(obj.data.bones) if obj.type == "ARMATURE" else []
+
+
 def _shared_take(objects: list[bpy.types.Object]) -> tuple[str, list[bpy.types.Action]] | None:
     """The one multi-object source take these objects' clips were cut from, with its clip
     actions in order; None if the clips have no such origin. Raises if the clips no longer
@@ -1407,14 +1457,17 @@ def _push_shared_take(
             strip = tracks[obj].strips.new(action[CLIP_PROPERTY], frame, action)
             strip.action_slot = slot
         clips.append(
-            unity.ClipAnimation(
-                name=action[CLIP_PROPERTY],
-                take_name=take,
-                first_frame=float(frame),
-                last_frame=frame + end - start,
-                wrap_mode=unity.WRAP_LOOP if action.use_cyclic else unity.WRAP_DEFAULT,
-                loop=action.use_cyclic,
-                loop_time=action.use_cyclic,
+            _root_motion(
+                unity.ClipAnimation(
+                    name=action[CLIP_PROPERTY],
+                    take_name=take,
+                    first_frame=float(frame),
+                    last_frame=frame + end - start,
+                    wrap_mode=unity.WRAP_LOOP if action.use_cyclic else unity.WRAP_DEFAULT,
+                    loop=action.use_cyclic,
+                    loop_time=action.use_cyclic,
+                ),
+                action,
             )
         )
         frame = math.ceil(frame + end - start) + 1
@@ -1463,14 +1516,17 @@ def _export_clips(
             raise ValueError(f"FBX take {take} has no matching Blender action")
         start, end = action.frame_range
         clips.append(
-            unity.ClipAnimation(
-                name=take.split("|")[-1],
-                take_name=take,
-                first_frame=0.0,
-                last_frame=end - start,
-                wrap_mode=unity.WRAP_LOOP if action.use_cyclic else unity.WRAP_DEFAULT,
-                loop=action.use_cyclic,
-                loop_time=action.use_cyclic,
+            _root_motion(
+                unity.ClipAnimation(
+                    name=take.split("|")[-1],
+                    take_name=take,
+                    first_frame=0.0,
+                    last_frame=end - start,
+                    wrap_mode=unity.WRAP_LOOP if action.use_cyclic else unity.WRAP_DEFAULT,
+                    loop=action.use_cyclic,
+                    loop_time=action.use_cyclic,
+                ),
+                action,
             )
         )
     return clips
@@ -1572,8 +1628,12 @@ def export_asset(
     else:
         clips = _export_clips(takes, _fbx_take_names(fbx))
     remaps, notes = _export_materials(out_dir, fbx_names, texture_guids, asset, library_root)
-    if clips or remaps:
-        unity.write_model_meta(fbx.with_name(fbx.name + unity.META_SUFFIX), clips, remaps)
+    rig, rig_notes = _rig(objects, asset, clips)
+    notes += rig_notes
+    if rig is None:  # root motion settings mean nothing without the source rig
+        clips = [replace(c, root_motion=()) for c in clips]
+    if clips or remaps or rig:
+        unity.write_model_meta(fbx.with_name(fbx.name + unity.META_SUFFIX), clips, remaps, rig)
     if values := _unity_values(objects, asset):
         (out_dir / f"{asset}.materials.json").write_text(json.dumps(values, indent=2), "utf-8")
     records = records_of(objects)
