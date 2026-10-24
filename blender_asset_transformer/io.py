@@ -9,8 +9,9 @@ import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+import bmesh
 import bpy
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 
 from . import library, licensing, unity
 
@@ -20,6 +21,11 @@ TYPE_PROPERTY = "bat_type"
 MATERIALS_DIR = "Materials"
 NATIVE_IMPORTER_META = "NativeFormatImporter:\n  externalObjects: {}\n  mainObjectFileID: 2100000\n"
 SOURCE_PROPERTY = "bat_source_mat"  # Unity .mat a Blender material was wired from
+LOOK_COLOR_PROPERTY = "bat_look_color"  # sRGB foliage color over the mask (Apply Look)
+TRIPLANAR_PROPERTY = "bat_triplanar"  # tile size of a triplanar material; baked on export
+BAKE_SIZES = (256, 4096)  # smallest and largest baked texture edge, in pixels
+BAKE_SAMPLES = 4
+BAKE_MARGIN = 8  # pixels the bake bleeds past each island against mip seams
 LOD_NAME = re.compile(r"_lod\d+(\.\d{3})?$", re.IGNORECASE)  # Unity's LOD Group naming
 WIRED_NODES = {"TEX_IMAGE", "NORMAL_MAP", "SEPARATE_COLOR", "MATH", "GROUP"}
 SHADER_PROPERTY = "bat_unity_shader"  # Unity shader GUID of the source .mat
@@ -351,7 +357,7 @@ def _use_vertex_colors(material: bpy.types.Material, objects: list[bpy.types.Obj
             return
 
 
-def _srgb_to_linear(c: float) -> float:
+def srgb_to_linear(c: float) -> float:
     return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
 
 
@@ -407,7 +413,7 @@ def apply_unity_shader(material: bpy.types.Material, mat_path: Path) -> None:
             raise ValueError(f"{mat_path.name}: foliage shader value {prop} missing")
         value = values[prop]
         if kind == "NodeSocketColor":
-            value = (*(_srgb_to_linear(c) for c in value[:3]), 1.0)
+            value = (*(srgb_to_linear(c) for c in value[:3]), 1.0)
         node.inputs[name].default_value = value
     tree.links.new(mask.outputs["Alpha"], node.inputs["Mask Alpha"])
     tree.links.new(node.outputs["Base Color"], bsdf.inputs["Base Color"])
@@ -864,18 +870,87 @@ def _role_of(node: bpy.types.Node) -> str | None:
     return node.label if node.label in ROLE_SUFFIXES else None
 
 
+def role_node(material: bpy.types.Material | None, role: str) -> bpy.types.Node | None:
+    """The image node wired for `role` (one of ROLE_SUFFIXES) on `material`, or None."""
+    if material is None or material.node_tree is None:
+        return None
+    return next(
+        (
+            node
+            for node in material.node_tree.nodes
+            if node.type == "TEX_IMAGE" and node.image and _role_of(node) == role
+        ),
+        None,
+    )
+
+
+def scoped_faces(obj: bpy.types.Object, slot: int, scope: str, group: str = "") -> list[int]:
+    """Indices of the slot's faces in scope: all of them, those selected in Edit Mode (sync the
+    mesh first), or those whose vertices all carry weight in vertex group `group`."""
+    faces = [poly for poly in obj.data.polygons if poly.material_index == slot]
+    if scope == "SELECTED":
+        faces = [poly for poly in faces if poly.select]
+    elif scope == "GROUP":
+        found = obj.vertex_groups.get(group)
+        if found is None:
+            raise ValueError(f"{obj.name}: choose a vertex group")
+        weighted = {
+            vert.index
+            for vert in obj.data.vertices
+            if any(g.group == found.index and g.weight > 0 for g in vert.groups)
+        }
+        faces = [poly for poly in faces if all(v in weighted for v in poly.vertices)]
+    elif scope != "SLOT":
+        raise ValueError(f"unknown scope {scope}")
+    if not faces:
+        raise ValueError(f"{obj.name}: no faces of slot {slot} in the chosen scope")
+    return [poly.index for poly in faces]
+
+
+def assign_material(obj: bpy.types.Object, faces: list[int], material: bpy.types.Material) -> int:
+    """Give `faces` the object's slot holding `material`, adding the slot if needed."""
+    if obj.data.users > 1:
+        raise ValueError(f"{obj.name}: mesh data is shared; make it single-user first")
+    index = next((i for i, s in enumerate(obj.material_slots) if s.material == material), None)
+    if index is None:
+        obj.data.materials.append(material)
+        index = len(obj.material_slots) - 1
+    for face in faces:
+        obj.data.polygons[face].material_index = index
+    return index
+
+
+def _export_names(objects: list[bpy.types.Object]) -> dict[bpy.types.Material, str]:
+    """Unity name per exported material: its source .mat stem. A material sharing that stem
+    with another (a copy such as `.001`) exports under its own Blender name instead, so it
+    gets its own .mat and textures. The material named like the stem, else the first by
+    name, keeps the stem."""
+    materials = dict.fromkeys(s.material for o in objects for s in o.material_slots if s.material)
+    ordered = sorted(materials, key=lambda m: (m.name != _source_mat_name(m), m.name))
+    names: dict[bpy.types.Material, str] = {}
+    taken: set[str] = set()
+    for material in ordered:
+        name = _source_mat_name(material)
+        if name in taken:
+            base = name = bpy.path.clean_name(material.name)
+            suffix = 2
+            while name in taken:
+                name, suffix = f"{base}_{suffix}", suffix + 1
+        taken.add(name)
+        names[material] = name
+    return names
+
+
 def _texture_jobs(
-    objects: list[bpy.types.Object], asset: str
+    names: dict[bpy.types.Material, str], asset: str
 ) -> list[tuple[bpy.types.Image, str, bpy.types.Material, str]]:
     """(image, dest stem name, material, role) for each wired texture."""
-    materials = list(
-        dict.fromkeys(s.material for o in objects for s in o.material_slots if s.material)
-    )
     jobs = []
-    for material in materials:
+    for material, name in names.items():
         if not material.node_tree:
             continue
-        prefix = asset if len(materials) == 1 else f"{asset}_{_mat_name(material.name)}"
+        own = name if name != _source_mat_name(material) else _mat_name(material.name)
+        prefix = asset if len(names) == 1 else f"{asset}_{own}"
         for node in material.node_tree.nodes:
             role = _role_of(node) if node.type == "TEX_IMAGE" and node.image else None
             if role:
@@ -887,6 +962,14 @@ def _source_mat_name(material: bpy.types.Material) -> str:
     """Unity .mat stem when known, else the Blender material name without .001."""
     source = material.get(SOURCE_PROPERTY) or ""
     return Path(source).stem if source else _mat_name(material.name)
+
+
+def _mask_fill_srgb(material: bpy.types.Material) -> tuple[float, float, float] | None:
+    """RGB the exported base map is filled with, keeping its alpha: white under a foliage look
+    (its .mat carries the color), else the ASFolliage leaf color."""
+    if material.get(LOOK_COLOR_PROPERTY):
+        return 1.0, 1.0, 1.0
+    return _foliage_tint_srgb(material)
 
 
 def _foliage_tint_srgb(material: bpy.types.Material) -> tuple[float, float, float] | None:
@@ -922,7 +1005,7 @@ def _ensure_pixels(image: bpy.types.Image) -> None:
         raise ValueError(f"texture {image.name} has no pixel data to export")
 
 
-def _read_pixels(image: bpy.types.Image) -> array.array:
+def read_pixels(image: bpy.types.Image) -> array.array:
     """Flat RGBA float buffer via foreach_get; bpy_prop_array does not support step slicing."""
     _ensure_pixels(image)
     buf = array.array("f", bytes(4 * len(image.pixels)))
@@ -930,7 +1013,7 @@ def _read_pixels(image: bpy.types.Image) -> array.array:
     return buf
 
 
-def _save_png(
+def save_png(
     image: bpy.types.Image,
     dst: Path,
     tint_srgb: tuple[float, float, float] | None,
@@ -941,9 +1024,9 @@ def _save_png(
     old_pixels = None
     try:
         if tint_srgb is not None:
-            old_pixels = _read_pixels(image)
+            old_pixels = read_pixels(image)
             tinted = array.array("f", old_pixels)
-            r, g, b = (_srgb_to_linear(c) for c in tint_srgb)
+            r, g, b = (srgb_to_linear(c) for c in tint_srgb)
             n = len(tinted) // 4
             tinted[0::4] = array.array("f", [r]) * n
             tinted[1::4] = array.array("f", [g]) * n
@@ -965,7 +1048,7 @@ def _assert_png_has_alpha(path: Path, label: str) -> None:
     try:
         if img.channels < 4:
             raise ValueError(f"{label}: exported {path.name} has no alpha channel")
-        alphas = _read_pixels(img)[3::4]
+        alphas = read_pixels(img)[3::4]
         if not alphas:
             raise ValueError(f"{label}: exported {path.name} has no pixels")
         amin, amax = min(alphas), max(alphas)
@@ -979,6 +1062,10 @@ def _assert_png_has_alpha(path: Path, label: str) -> None:
 
 
 LINEAR_ROLES = {"Metallic", "Roughness", "AO"}  # data maps: never sRGB
+# Without serializedVersion Unity reads a minimal TextureImporter as a legacy one
+# (a color map imports as a single-channel texture and renders black)
+TEXTURE_IMPORTER_VERSION = 10
+DEFAULT_TEXTURE_TYPE = 0  # TextureImporter textureType for color and data maps
 NORMAL_TEXTURE_TYPE = 1  # TextureImporter textureType for normal maps
 
 
@@ -995,9 +1082,11 @@ def _write_texture_meta(src: Path | None, dst: Path, role: str) -> str:
         if count != 2:
             raise ValueError(f"{meta_src.name}: expected fileFormatVersion and guid lines")
     else:
-        text = "TextureImporter:\n"
-        if role == "Normal":
-            text += f"  textureType: {NORMAL_TEXTURE_TYPE}\n"
+        texture_type = NORMAL_TEXTURE_TYPE if role == "Normal" else DEFAULT_TEXTURE_TYPE
+        text = (
+            f"TextureImporter:\n  serializedVersion: {TEXTURE_IMPORTER_VERSION}\n"
+            f"  textureType: {texture_type}\n"
+        )
         if role in LINEAR_ROLES:
             text += "  mipmaps:\n    sRGBTexture: 0\n"
     if role in LINEAR_ROLES:
@@ -1068,6 +1157,7 @@ def _copy_library_texture(src: Path, dest_stem: Path, role: str) -> str:
 def _export_materials(
     out_dir: Path,
     fbx_names: dict[bpy.types.Material, str],
+    names: dict[bpy.types.Material, str],
     textures: dict[tuple, str],
     asset: str,
     library_root: Path | None,
@@ -1101,7 +1191,7 @@ def _export_materials(
                 raise ValueError(f"{material.name}: source material not found: {source_mat}")
             if library_root is None:
                 raise ValueError(f"{material.name}: no library set for its source material")
-            stem = source_mat.stem
+            stem = names[material]  # the source stem unless this is a copy
             pack_dir = (
                 library_root
                 / "Assets"
@@ -1109,10 +1199,13 @@ def _export_materials(
             )
             index = unity.guid_index(pack_dir)
             source_text = source_mat.read_text(encoding="utf-8", errors="replace")
-            tinted = _foliage_tint_srgb(material) is not None
+            look_color = material.get(LOOK_COLOR_PROPERTY)
+            look_color = tuple(look_color) if look_color else None
+            tinted = _foliage_tint_srgb(material) is not None and look_color is None
             shader_guid = unity.shader_guid(source_mat) or ""
             builtin = shader_guid.startswith(BUILTIN_GUID_PREFIX)
-            shader = None if builtin else find(index, shader_guid)
+            # a look's flat color over the mask is a URP Lit cutout, whatever the pack shader
+            shader = None if builtin or look_color else find(index, shader_guid)
             files = unity.urp_shader_files(shader, index) if shader else None
             if shader and files is None and library_root:  # dependencies in another pack?
                 every.update(every or unity.guid_index(library_root / "Assets"))
@@ -1143,8 +1236,11 @@ def _export_materials(
                 )
                 # a variant's parent stays in the library: keep it as a plain material
                 text = re.sub(r"(?m)^(  m_Parent: )\{[^}]*\}", r"\1{fileID: 0}", text)
+                text = unity.set_material_name(text, stem)
             else:
-                if not builtin:
+                if look_color:
+                    notes.append(f"{stem}: foliage look exported as a URP Lit cutout")
+                elif not builtin:
                     name = shader.name if shader else f"{shader_guid} (not in library)"
                     notes.append(f"{stem}: shader {name} isn't URP-ready; used URP Lit")
                 text = unity.lit_material(
@@ -1152,6 +1248,7 @@ def _export_materials(
                     source_mat,
                     {r: g for r, g in exported.items() if r in unity.LIT_SLOTS},
                     color_baked=tinted,
+                    base_color=look_color,
                 )
         mat_path = out_dir / MATERIALS_DIR / f"{stem}.mat"
         mat_path.parent.mkdir(exist_ok=True)
@@ -1197,13 +1294,13 @@ def _write_export_texture(
             try:
                 if tmp.alpha_mode == "NONE":
                     tmp.alpha_mode = "STRAIGHT"
-                _save_png(tmp, dst, tint_srgb)
+                save_png(tmp, dst, tint_srgb)
             finally:
                 bpy.data.images.remove(tmp)
         elif image.packed_file or image.has_data:
             if image.alpha_mode == "NONE":
                 image.alpha_mode = "STRAIGHT"
-            _save_png(image, dst, tint_srgb)
+            save_png(image, dst, tint_srgb)
         else:
             missing = bpy.path.abspath(image.filepath) if image.filepath else "no filepath"
             raise ValueError(
@@ -1220,12 +1317,12 @@ def _write_export_texture(
     return dst, _write_texture_meta(src, dst, role)
 
 
-def _rename_to_source_mats(objects: list[bpy.types.Object]) -> list[tuple[bpy.types.Material, str]]:
-    """Rename materials to their Unity .mat stems for FBX (helps Search and Remap)."""
+def _rename_to_source_mats(
+    names: dict[bpy.types.Material, str],
+) -> list[tuple[bpy.types.Material, str]]:
+    """Rename materials to their Unity names for FBX (helps Search and Remap)."""
     saved: list[tuple[bpy.types.Material, str]] = []
-    materials = dict.fromkeys(s.material for o in objects for s in o.material_slots if s.material)
-    for material in materials:
-        want = _source_mat_name(material)
+    for material, want in names.items():
         if material.name == want:
             continue
         saved.append((material, material.name))
@@ -1282,11 +1379,10 @@ def _restore_links(saved: list[tuple]) -> None:
             tree.links.new(from_socket, to_socket)
 
 
-def _unity_values(objects: list[bpy.types.Object], asset: str) -> dict:
+def _unity_values(names: dict[bpy.types.Material, str]) -> dict:
     """Unity shader GUID + .mat values per material, so Unity can rebuild the look."""
-    materials = dict.fromkeys(s.material for o in objects for s in o.material_slots if s.material)
     out: dict = {}
-    for m in materials:
+    for m, name in names.items():
         if not m.get(SHADER_PROPERTY):
             continue
         source = m.get(SOURCE_PROPERTY, "")
@@ -1294,7 +1390,7 @@ def _unity_values(objects: list[bpy.types.Object], asset: str) -> dict:
         if source:
             meta = Path(source).with_name(Path(source).name + unity.META_SUFFIX)
             guid = unity.meta_guid(meta) or ""
-        out[_source_mat_name(m)] = {
+        out[name] = {
             "shader": m.get(SHADER_PROPERTY, ""),
             "values": json.loads(m.get(VALUES_PROPERTY) or "{}"),
             "source": source,
@@ -1504,6 +1600,170 @@ def _fbx_take_names(fbx: Path) -> list[str]:
     return [e.props[1].split(FBX_NAME_CLASS_SEP)[0].decode() for e in stacks]
 
 
+def _bake_triplanar(
+    objects: list[bpy.types.Object],
+) -> tuple[list[tuple[bpy.types.Node, bpy.types.Image]], list[str]]:
+    """Bake each triplanar material's textures onto its mesh's packed UVs, so the export ships
+    plain textures URP Lit can show. Each baked image replaces the original on its node until
+    `_unswap`. Returns the swaps and notes."""
+    materials = sorted(
+        {
+            slot.material
+            for obj in objects
+            for slot in obj.material_slots
+            if slot.material and slot.material.get(TRIPLANAR_PROPERTY)
+        },
+        key=lambda material: material.name,
+    )
+    if not materials:
+        return [], []
+    scene, view = bpy.context.scene, bpy.context.view_layer
+    engine, samples = scene.render.engine, scene.cycles.samples
+    active, selected = view.objects.active, [obj for obj in view.objects if obj.select_get()]
+    swaps: list[tuple[bpy.types.Node, bpy.types.Image]] = []
+    notes = []
+    try:
+        scene.render.engine = "CYCLES"
+        scene.cycles.samples = BAKE_SAMPLES
+        for material in materials:
+            users = [obj for obj in objects if material.name in obj.data.materials]
+            if len(users) != 1:
+                raise ValueError(
+                    f"{material.name}: a triplanar material bakes onto one mesh; retile each mesh"
+                )
+            size = _bake_material(material, users[0], swaps)
+            notes.append(f"{material.name}: triplanar textures baked at {size} px")
+    except Exception:
+        _unswap(swaps)
+        raise
+    finally:
+        scene.render.engine, scene.cycles.samples = engine, samples
+        for obj in view.objects:
+            obj.select_set(obj in selected)
+        view.objects.active = active
+    return swaps, notes
+
+
+def _bake_material(
+    material: bpy.types.Material,
+    obj: bpy.types.Object,
+    swaps: list[tuple[bpy.types.Node, bpy.types.Image]],
+) -> int:
+    """Bake every role image of `material` on a throwaway copy of `obj` holding only its faces
+    (Cycles would otherwise bake into other materials' images too). Returns the texture size."""
+    view = bpy.context.view_layer
+    temp = obj.copy()
+    temp.data = obj.data.copy()
+    bpy.context.scene.collection.objects.link(temp)
+    try:
+        slots = {i for i, slot in enumerate(obj.material_slots) if slot.material == material}
+        bm = bmesh.new()
+        bm.from_mesh(temp.data)
+        bmesh.ops.delete(
+            bm, geom=[f for f in bm.faces if f.material_index not in slots], context="FACES"
+        )
+        for face in bm.faces:
+            face.material_index = 0
+        bm.to_mesh(temp.data)
+        bm.free()
+        temp.data.materials.clear()
+        temp.data.materials.append(material)
+        for item in view.objects:
+            item.select_set(item == temp)
+        view.objects.active = temp
+        size = _bake_size(temp, material)
+        for node in [n for n in material.node_tree.nodes if n.type == "TEX_IMAGE" and n.image]:
+            role = _role_of(node)
+            if role is None:
+                continue
+            # Cycles premultiplies Color by an unlinked alpha (often smoothness): keep them apart
+            mode, node.image.alpha_mode = node.image.alpha_mode, "CHANNEL_PACKED"
+            try:
+                baked = _bake_socket(material, node.outputs["Color"], size, role)
+                alpha = None
+                if node.image.channels == 4:
+                    alpha = _bake_socket(material, node.outputs["Alpha"], size, "Alpha")
+            finally:
+                node.image.alpha_mode = mode
+            if alpha:
+                pixels = array.array("f", bytes(4 * 4 * size * size))
+                alpha.pixels.foreach_get(pixels)
+                values = array.array("f", bytes(4 * 4 * size * size))
+                baked.pixels.foreach_get(values)
+                values[3::4] = pixels[0::4]
+                baked.pixels.foreach_set(values)
+                bpy.data.images.remove(alpha)
+            baked.pack()
+            swaps.append((node, node.image))
+            node.image = baked
+    finally:
+        mesh = temp.data
+        bpy.data.objects.remove(temp)
+        bpy.data.meshes.remove(mesh)
+    return size
+
+
+def _bake_size(obj: bpy.types.Object, material: bpy.types.Material) -> int:
+    """Texture edge that keeps the source texels per meter on the packed layout."""
+    mesh, layer = obj.data, obj.data.uv_layers.active
+    world = sum(poly.area for poly in mesh.polygons) * obj.matrix_world.median_scale**2
+    uv = 0.0
+    for poly in mesh.polygons:
+        points = [Vector(layer.data[loop].uv) for loop in poly.loop_indices]
+        uv += abs(sum(a.cross(b) for a, b in zip(points, points[1:] + points[:1], strict=True)))
+    if world <= 0 or uv <= 0:
+        raise ValueError(f"{material.name}: nothing to bake onto (no area or UVs)")
+    widths = [
+        n.image.size[0] for n in material.node_tree.nodes if n.type == "TEX_IMAGE" and n.image
+    ]
+    texels = max(widths) / material[TRIPLANAR_PROPERTY] * math.sqrt(world / (uv / 2))
+    low, high = BAKE_SIZES
+    return min(high, max(low, 2 ** math.ceil(math.log2(max(texels, 1)))))
+
+
+def _bake_socket(
+    material: bpy.types.Material, socket: bpy.types.NodeSocket, size: int, role: str
+) -> bpy.types.Image:
+    """Bake what `socket` outputs, unlit, into a new size x size image."""
+    tree = material.node_tree
+    output = next(n for n in tree.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output)
+    surface = output.inputs["Surface"]
+    previous = [link.from_socket for link in surface.links]
+    image = bpy.data.images.new(f"{material.name}_{role}_Baked", size, size, alpha=True)
+    color = role in ROLE_SUFFIXES and role not in NON_COLOR_ROLES
+    image.colorspace_settings.name = "sRGB" if color else "Non-Color"
+    emission = tree.nodes.new("ShaderNodeEmission")
+    target = tree.nodes.new("ShaderNodeTexImage")
+    target.image = image
+    active = tree.nodes.active
+    try:
+        tree.links.new(socket, emission.inputs["Color"])
+        tree.links.new(emission.outputs["Emission"], surface)
+        tree.nodes.active = target
+        if "FINISHED" not in bpy.ops.object.bake(type="EMIT", margin=BAKE_MARGIN, use_clear=True):
+            raise ValueError(f"{material.name}: baking {role} failed")
+    except Exception:
+        bpy.data.images.remove(image)
+        raise
+    finally:
+        tree.nodes.remove(emission)
+        tree.nodes.remove(target)
+        for source in previous:
+            tree.links.new(source, surface)
+        tree.nodes.active = active
+    return image
+
+
+def _unswap(swaps: list[tuple[bpy.types.Node, bpy.types.Image]]) -> None:
+    """Put the original images back and drop the baked ones."""
+    for node, original in reversed(swaps):
+        baked = node.image
+        node.image = original
+        if baked is not original and baked.users == 0:
+            bpy.data.images.remove(baked)
+    swaps.clear()
+
+
 def _export_clips(
     takes: dict[str, bpy.types.Action], written: list[str]
 ) -> list[unity.ClipAnimation]:
@@ -1582,9 +1842,13 @@ def export_asset(
     fbx = out_dir / f"{asset}.fbx"
     texture_guids: dict[tuple, str] = {}
     fbx_names: dict[bpy.types.Material, str] = {}
+    names = _export_names(objects)
+    swaps: list[tuple[bpy.types.Node, bpy.types.Image]] = []
+    bake_notes: list[str] = []
     try:
-        for image, name, material, role in _texture_jobs(objects, asset):
-            tint = _foliage_tint_srgb(material) if role == "BaseColor" else None
+        swaps, bake_notes = _bake_triplanar(objects)
+        for image, name, material, role in _texture_jobs(names, asset):
+            tint = _mask_fill_srgb(material) if role == "BaseColor" else None
             dst, guid = _write_export_texture(
                 image, out_dir / name, tint_srgb=tint, require_alpha=tint is not None, role=role
             )
@@ -1594,7 +1858,7 @@ def export_asset(
             if image.alpha_mode == "NONE" and tint is not None:
                 image.alpha_mode = "STRAIGHT"
         saved_links = _foliage_export_links(objects)
-        saved_names = _rename_to_source_mats(objects)
+        saved_names = _rename_to_source_mats(names)
         fbx_names = {
             s.material: s.material.name for o in objects for s in o.material_slots if s.material
         }
@@ -1621,20 +1885,22 @@ def export_asset(
         _restore_links(saved_links)
         for image, path in original_paths.items():
             image.filepath = path
+        _unswap(swaps)
     if shared:
         if _fbx_take_names(fbx) != [shared[0]]:
             raise ValueError(f"{fbx.name}: expected the single take {shared[0]}")
         clips = cut_clips
     else:
         clips = _export_clips(takes, _fbx_take_names(fbx))
-    remaps, notes = _export_materials(out_dir, fbx_names, texture_guids, asset, library_root)
+    remaps, notes = _export_materials(out_dir, fbx_names, names, texture_guids, asset, library_root)
+    notes = bake_notes + notes
     rig, rig_notes = _rig(objects, asset, clips)
     notes += rig_notes
     if rig is None:  # root motion settings mean nothing without the source rig
         clips = [replace(c, root_motion=()) for c in clips]
     if clips or remaps or rig:
         unity.write_model_meta(fbx.with_name(fbx.name + unity.META_SUFFIX), clips, remaps, rig)
-    if values := _unity_values(objects, asset):
+    if values := _unity_values(names):
         (out_dir / f"{asset}.materials.json").write_text(json.dumps(values, indent=2), "utf-8")
     records = records_of(objects)
     (out_dir / licensing.ATTRIBUTION_FILE).write_text(

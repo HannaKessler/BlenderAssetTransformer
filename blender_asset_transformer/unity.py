@@ -411,17 +411,24 @@ def _rgba(color: tuple[float, ...]) -> str:
 
 
 def lit_material(
-    name: str, source_mat: Path | str, textures: dict[str, str], *, color_baked: bool = False
+    name: str,
+    source_mat: Path | str,
+    textures: dict[str, str],
+    *,
+    color_baked: bool = False,
+    base_color: tuple[float, float, float] | None = None,
 ) -> str:
     """URP Lit .mat translated from a source .mat of any shader, using exported texture GUIDs
     per role. source_mat may also be .mat text.
-    color_baked: the base color texture already carries the tint, so the color stays white."""
+    color_baked: the base color texture already carries the tint, so the color stays white.
+    base_color: an sRGB color over a white mask base map; the material clips on its alpha."""
     if isinstance(source_mat, Path):
         text = source_mat.read_text(encoding="utf-8", errors="replace")
     else:
         text = source_mat
     values = material_values(text)
-    cutout, two_sided = _is_cutout(text, values), _is_two_sided(text, values)
+    cutout = base_color is not None or _is_cutout(text, values)
+    two_sided = _is_two_sided(text, values)
     if values.get("_AlphaCutoffEnable") == 1 and "_AlphaCutoff" in values:
         cutoff = values["_AlphaCutoff"]
     else:
@@ -460,6 +467,8 @@ def lit_material(
     color = values.get("_BaseColor") or values.get("_Color") or (1.0, 1.0, 1.0, 1.0)
     if color_baked:
         color = (1.0, 1.0, 1.0, color[3] if len(color) > 3 else 1.0)
+    if base_color is not None:
+        color = (*base_color, 1.0)
     return (
         "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!21 &2100000\nMaterial:\n"
         f"  serializedVersion: 8\n  m_Name: {_yaml_quote(name)}\n  m_Shader: {URP_LIT_SHADER}\n"
@@ -554,6 +563,11 @@ def texture_refs(text: str) -> dict[str, str]:
             refs.setdefault(prop, ref.group(1))
             prop = None
     return refs
+
+
+def set_material_name(text: str, name: str) -> str:
+    """Set the Material's m_Name; a copy of a library .mat would keep the source's name."""
+    return re.sub(r"(?m)^(  m_Name: ).*$", lambda m: m.group(1) + _yaml_quote(name), text, count=1)
 
 
 def set_texture_refs(text: str, refs: dict[str, str]) -> str:

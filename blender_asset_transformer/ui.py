@@ -2,7 +2,7 @@
 
 import bpy
 
-from . import library, operators
+from . import bind, library, looks, operators, tiling
 
 
 class BAT_UL_entries(bpy.types.UIList):
@@ -118,3 +118,111 @@ class BAT_PT_main(bpy.types.Panel):
         row = layout.row()
         row.scale_y = 1.4
         row.operator("bat.export_staged", icon="EXPORT", depress=True)
+
+
+class BAT_UL_bind_meshes(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _prop) -> None:
+        layout.label(text=item.object.name if item.object else "(missing)", icon="MESH_DATA")
+
+
+class BAT_UL_excluded(bpy.types.UIList):
+    def draw_item(self, _context, layout, _data, item, _icon, _active_data, _prop) -> None:
+        layout.label(text=item.name, icon="BONE_DATA")
+
+
+class KitbashPanel:
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Kitbash"
+
+
+class BAT_PT_bind(KitbashPanel, bpy.types.Panel):
+    bl_label = "Bind to Rig"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        scene = context.scene
+        layout.template_list(
+            "BAT_UL_bind_meshes", "", scene, "bat_bind_meshes", scene, "bat_bind_mesh_index", rows=4
+        )
+        row = layout.row(align=True)
+        row.operator("bat.bind_use_selected", icon="ADD")
+        row.operator("bat.bind_remove_mesh", icon="REMOVE", text="")
+        if meshes := bind.targets(scene):
+            layout.label(text=f"Excluded on all {len(meshes)} meshes")
+            layout.template_list(
+                "BAT_UL_excluded",
+                "",
+                meshes[0].data,
+                "bat_excluded_bones",
+                context.window_manager,
+                "bat_excluded_index",
+                rows=4,
+            )
+        row = layout.row(align=True)
+        row.operator("bat.exclude_bones", icon="REMOVE")
+        row.operator("bat.include_bones", icon="ADD")
+        layout.operator("bat.bind_to_rig", icon="ARMATURE_DATA")
+
+
+def _draw_scope(layout: bpy.types.UILayout, wm: bpy.types.WindowManager) -> None:
+    row = layout.row(align=True)
+    row.prop(wm, "bat_scope", expand=True)
+    if wm.bat_scope == "GROUP":
+        layout.prop(wm, "bat_scope_group")
+
+
+class BAT_PT_surface(KitbashPanel, bpy.types.Panel):
+    bl_label = "Unify Surface"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        wm = context.window_manager
+        layout.prop(wm, "bat_tiling_material")
+        layout.prop(wm, "bat_surface_slot")
+        _draw_scope(layout, wm)
+        layout.prop(wm, "bat_tile_density")
+        if wm.bat_tile_density == tiling.MANUAL:
+            layout.prop(wm, "bat_tile_size")
+        layout.prop(wm, "bat_unwrap_method")
+        row = layout.row(align=True)
+        row.operator("bat.assign_tiling")
+        row.operator("bat.retile")
+
+
+def _draw_look_rows(layout: bpy.types.UILayout, wm: bpy.types.WindowManager, section: str) -> None:
+    props = (
+        ("bat_foliage_palette", "bat_foliage_textures")
+        if section == looks.FOLIAGE
+        else ("bat_surface_palette", "bat_surface_textures")
+    )
+    for prop, store in zip(props, (looks.PALETTES, looks.TEXTURE_SETS), strict=True):
+        row = layout.row(align=True)
+        row.prop(wm, prop)
+        remove = row.operator("bat.remove_look", text="", icon="X")
+        remove.section, remove.store = section, store
+    row = layout.row(align=True)
+    row.operator("bat.save_palette").section = section
+    row.operator("bat.save_texture_set").section = section
+    layout.operator("bat.apply_look", icon="COLOR").section = section
+
+
+class BAT_PT_look(KitbashPanel, bpy.types.Panel):
+    bl_label = "Apply Look"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        layout = self.layout
+        wm = context.window_manager
+        if message := looks.error():
+            layout.label(text=message, icon="ERROR")
+        layout.prop(wm, "bat_look_name")
+        _draw_scope(layout, wm)
+        box = layout.box()
+        box.label(text="Surface")
+        box.prop(wm, "bat_surface_category")
+        box.prop(wm, "bat_surface_slot")
+        _draw_look_rows(box, wm, operators.SURFACE)
+        box = layout.box()
+        box.label(text="Foliage")
+        box.prop(wm, "bat_foliage_slot")
+        _draw_look_rows(box, wm, looks.FOLIAGE)
